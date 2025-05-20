@@ -1,0 +1,30 @@
+# ──────────────
+# Build Artifacts
+# ──────────────
+
+# Ignore compiled binaries in utils/
+utils/lidar_loader
+
+# Ignore general build/IDE artifacts
+*.o
+*.obj
+*.exe
+*.out
+*.log
+
+# ──────────────
+# Temporary SQLite Files
+# ──────────────
+
+# Keep .db files, but ignore SQLite journal files
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ──────────────
+# Editor/Backup Files
+# ──────────────
+
+*~
+*.swp
+*.bak
