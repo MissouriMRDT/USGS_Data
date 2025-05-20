@@ -9,7 +9,7 @@ This repository provides a C++ utility for converting raw USGS **LAS 1.4** LiDAR
 
 ```
 
-USGS\_Data/
+USGS_Data/
 ├── data/
 │   ├── las/            # Raw USGS .las files organized by region
 │   │   └── MDRS/       # Example: Mars Desert Research Station dataset
@@ -21,7 +21,6 @@ USGS\_Data/
 ├── .gitattributes
 ├── .gitignore
 └── README.md
-
 ````
 
 ---
