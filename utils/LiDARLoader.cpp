@@ -42,16 +42,16 @@
  * application.
  *
  * Fields:
- * - pointDataFormat: Format ID for point record structure (e.g., 6 for LAS 1.4)
- * - xScale, yScale, zScale: Scale factors for converting raw X/Y/Z integers
- * - xOffset, yOffset, zOffset: Offsets added to scaled X/Y/Z values
- * - maxX, maxY, maxZ: Bounding box maximum coordinates
- * - minX, minY, minZ: Bounding box minimum coordinates
- * - headerSize: Total size of the LAS file header (typically 375 bytes for LAS 1.4)
- * - numberOfPointRecords: Total number of point records in the file
- * - numVLRs: Number of Variable Length Records (VLRs) following the header
- * - offsetToPointData: Byte offset in the file where point data begins
- * - pointDataRecordLength: Size in bytes of a single point record
+ * - unPointDataFormat: Format ID for point record structure (e.g., 6 for LAS 1.4)
+ * - dXScale, dYScale, dZScale: Scale factors for converting raw X/Y/Z integers
+ * - dXOffset, dYOffset, dZOffset: Offsets added to scaled X/Y/Z values
+ * - dMaxX, dMaxY, dMaxZ: Bounding box maximum coordinates
+ * - dMinX, dMinY, dMinZ: Bounding box minimum coordinates
+ * - unHeaderSize: Total size of the LAS file header (typically 375 bytes for LAS 1.4)
+ * - unNumberOfPointRecords: Total number of point records in the file
+ * - unNumVLRs: Number of Variable Length Records (VLRs) following the header
+ * - unOffsetToPointData: Byte offset in the file where point data begins
+ * - unPointRecordLength: Size in bytes of a single point record
  *
  * @note This structure is read directly from the LAS header using `memcpy`.
  *
@@ -60,16 +60,16 @@
  ******************************************************************************/
 struct LiDARLoader::MinimalLASHeader
 {
-        uint8_t pointDataFormat;
-        double xScale, yScale, zScale;
-        double xOffset, yOffset, zOffset;
-        double maxX, maxY, maxZ;
-        double minX, minY, minZ;
-        uint16_t headerSize;
-        uint64_t numberOfPointRecords;
-        uint32_t numVLRs;
-        uint32_t offsetToPointData;
-        uint16_t pointDataRecordLength;
+        uint8_t unPointDataFormat;
+        double dXScale, dYScale, dZScale;
+        double dXOffset, dYOffset, dZOffset;
+        double dMaxX, dMaxY, dMaxZ;
+        double dMinX, dMinY, dMinZ;
+        uint16_t unHeaderSize;
+        uint64_t unNumberOfPointRecords;
+        uint32_t unNumVLRs;
+        uint32_t unOffsetToPointData;
+        uint16_t unPointRecordLength;
 };
 
 #pragma pack(push, 1)
@@ -97,11 +97,11 @@ struct LiDARLoader::MinimalLASHeader
  ******************************************************************************/
 struct LiDARLoader::VLRHeader
 {
-        uint16_t reserved;
-        char userID[16];
-        uint16_t recordID;
-        uint16_t recordLengthAfterHeader;
-        char description[32];
+        uint16_t unReserved;
+        char szUserID[16];
+        uint16_t unRecordID;
+        uint16_t unRecordLengthAfterHeader;
+        char szDescription[32];
 };
 
 #pragma pack(pop)
@@ -125,31 +125,31 @@ struct LiDARLoader::VLRHeader
  ******************************************************************************/
 enum class LiDARLoader::PointClassification : uint8_t
 {
-    CreatedNeverClassified = 0,     // Created, never classified
-    Unclassified           = 1,     // Unclassified
-    Ground                 = 2,     // Ground
-    LowVegetation          = 3,     // Low Vegetation
-    MediumVegetation       = 4,     // Medium Vegetation
-    HighVegetation         = 5,     // High Vegetation
-    Building               = 6,     // Building
-    LowPointNoise          = 7,     // Low Point (Noise)
-    Reserved8              = 8,     // Reserved
-    Water                  = 9,     // Water
-    Rail                   = 10,    // Rail
-    RoadSurface            = 11,    // Road Surface
-    Reserved12             = 12,    // Reserved
-    WireGuardShield        = 13,    // Wire – Guard (Shield)
-    WireConductorPhase     = 14,    // Wire – Conductor (Phase)
-    TransmissionTower      = 15,    // Transmission Tower
-    WireStructureConnector = 16,    // Wire-Structure Connector
-    BridgeDeck             = 17,    // Bridge Deck
-    HighNoise              = 18,    // High Noise
-    OverheadStructure      = 19,    // Overhead Structure
-    IgnoredGround          = 20,    // Ignored Ground
-    Snow                   = 21,    // Snow
-    TemporalExclusion      = 22,    // Temporal Exclusion
-    Reserved               = 23,    // 23–63
-    UserDefinable          = 64     // 64–255
+    unCreatedNeverClassified = 0,     // Created, never classified
+    unUnclassified           = 1,     // Unclassified
+    unGround                 = 2,     // Ground
+    unLowVegetation          = 3,     // Low Vegetation
+    unMediumVegetation       = 4,     // Medium Vegetation
+    unHighVegetation         = 5,     // High Vegetation
+    unBuilding               = 6,     // Building
+    unLowPointNoise          = 7,     // Low Point (Noise)
+    unReserved8              = 8,     // Reserved
+    unWater                  = 9,     // Water
+    unRail                   = 10,    // Rail
+    unRoadSurface            = 11,    // Road Surface
+    unReserved12             = 12,    // Reserved
+    unWireGuardShield        = 13,    // Wire – Guard (Shield)
+    unWireConductorPhase     = 14,    // Wire – Conductor (Phase)
+    unTransmissionTower      = 15,    // Transmission Tower
+    unWireStructureConnector = 16,    // Wire-Structure Connector
+    unBridgeDeck             = 17,    // Bridge Deck
+    unHighNoise              = 18,    // High Noise
+    unOverheadStructure      = 19,    // Overhead Structure
+    unIgnoredGround          = 20,    // Ignored Ground
+    unSnow                   = 21,    // Snow
+    unTemporalExclusion      = 22,    // Temporal Exclusion
+    unReserved               = 23,    // 23–63
+    unUserDefinable          = 64     // 64–255
 };
 
 /******************************************************************************
@@ -171,24 +171,24 @@ enum class LiDARLoader::PointClassification : uint8_t
  ******************************************************************************/
 enum class LiDARLoader::LASHeaderOffset : size_t
 {
-    Format                = 104,    // Point Data Record Format          | unsigned char      | 1 byte
-    XScaleFactor          = 131,    // X Scale Factor                    | double             | 8 bytes
-    YScaleFactor          = 139,    // Y Scale Factor                    | double             | 8 bytes
-    ZScaleFactor          = 147,    // Z Scale Factor                    | double             | 8 bytes
-    XOffset               = 155,    // X Offset                          | double             | 8 bytes
-    YOffset               = 163,    // Y Offset                          | double             | 8 bytes
-    ZOffset               = 171,    // Z Offset                          | double             | 8 bytes
-    XMax                  = 179,    // X Max                             | double             | 8 bytes
-    YMax                  = 195,    // Y Max                             | double             | 8 bytes
-    ZMax                  = 211,    // Z Max                             | double             | 8 bytes
-    XMin                  = 187,    // X Min                             | double             | 8 bytes
-    YMin                  = 203,    // Y Min                             | double             | 8 bytes
-    ZMin                  = 219,    // Z Min                             | double             | 8 bytes
-    NumberOfPointRecords  = 247,    // Number of Point Records           | unsigned long long | 8 bytes
-    HeaderSize            = 94,     // Header Size                       | unsigned short     | 2 bytes
-    NumberOfVLRs          = 100,    // Number of Variable Length Records | unsigned long      | 4 bytes
-    OffsetToPointData     = 96,     // Offset to Point Data              | unsigned long      | 4 bytes
-    PointDataRecordLength = 105     // Point Data Record Length          | unsigned short     | 2 bytes
+    siFormat                = 104,    // Point Data Record Format          | unsigned char      | 1 byte
+    siXScaleFactor          = 131,    // X Scale Factor                    | double             | 8 bytes
+    siYScaleFactor          = 139,    // Y Scale Factor                    | double             | 8 bytes
+    siZScaleFactor          = 147,    // Z Scale Factor                    | double             | 8 bytes
+    siXOffset               = 155,    // X Offset                          | double             | 8 bytes
+    siYOffset               = 163,    // Y Offset                          | double             | 8 bytes
+    siZOffset               = 171,    // Z Offset                          | double             | 8 bytes
+    siXMax                  = 179,    // X Max                             | double             | 8 bytes
+    siYMax                  = 195,    // Y Max                             | double             | 8 bytes
+    siZMax                  = 211,    // Z Max                             | double             | 8 bytes
+    siXMin                  = 187,    // X Min                             | double             | 8 bytes
+    siYMin                  = 203,    // Y Min                             | double             | 8 bytes
+    siZMin                  = 219,    // Z Min                             | double             | 8 bytes
+    siNumberOfPointRecords  = 247,    // Number of Point Records           | unsigned long long | 8 bytes
+    siHeaderSize            = 94,     // Header Size                       | unsigned short     | 2 bytes
+    siNumberOfVLRs          = 100,    // Number of Variable Length Records | unsigned long      | 4 bytes
+    siOffsetToPointData     = 96,     // Offset to Point Data              | unsigned long      | 4 bytes
+    siPointDataRecordLength = 105     // Point Data Record Length          | unsigned short     | 2 bytes
 };
 
 /******************************************************************************
@@ -225,41 +225,41 @@ static std::string MakeClassification(uint8_t unClassification)
     }
     else if (unClassification >= 23 && unClassification <= 63)
     {
-        eClassification = LiDARLoader::PointClassification::Reserved;
+        eClassification = LiDARLoader::PointClassification::unHighNoise;
     }
     else
     {
-        eClassification = LiDARLoader::PointClassification::UserDefinable;
+        eClassification = LiDARLoader::PointClassification::unUserDefinable;
     }
 
     // 2) Map and return enum value to a string
     switch (eClassification)
     {
-        case LiDARLoader::PointClassification::CreatedNeverClassified: return "Created (Never Classified)";
-        case LiDARLoader::PointClassification::Unclassified: return "Unclassified";
-        case LiDARLoader::PointClassification::Ground: return "Ground";
-        case LiDARLoader::PointClassification::LowVegetation: return "Low Vegetation";
-        case LiDARLoader::PointClassification::MediumVegetation: return "Medium Vegetation";
-        case LiDARLoader::PointClassification::HighVegetation: return "High Vegetation";
-        case LiDARLoader::PointClassification::Building: return "Building";
-        case LiDARLoader::PointClassification::LowPointNoise: return "Low Point (Noise)";
-        case LiDARLoader::PointClassification::Reserved8: return "Reserved";
-        case LiDARLoader::PointClassification::Water: return "Water";
-        case LiDARLoader::PointClassification::Rail: return "Rail";
-        case LiDARLoader::PointClassification::RoadSurface: return "Road Surface";
-        case LiDARLoader::PointClassification::Reserved12: return "Reserved";
-        case LiDARLoader::PointClassification::WireGuardShield: return "Wire – Guard (Shield)";
-        case LiDARLoader::PointClassification::WireConductorPhase: return "Wire – Conductor (Phase)";
-        case LiDARLoader::PointClassification::TransmissionTower: return "Transmission Tower";
-        case LiDARLoader::PointClassification::WireStructureConnector: return "Wire-Structure Connector";
-        case LiDARLoader::PointClassification::BridgeDeck: return "Bridge Deck";
-        case LiDARLoader::PointClassification::HighNoise: return "High Noise";
-        case LiDARLoader::PointClassification::OverheadStructure: return "Overhead Structure";
-        case LiDARLoader::PointClassification::IgnoredGround: return "Ignored Ground";
-        case LiDARLoader::PointClassification::Snow: return "Snow";
-        case LiDARLoader::PointClassification::TemporalExclusion: return "Temporal Exclusion";
-        case LiDARLoader::PointClassification::Reserved: return "Reserved";
-        case LiDARLoader::PointClassification::UserDefinable: return "User Definable";
+        case LiDARLoader::PointClassification::unCreatedNeverClassified: return "Created (Never Classified)";
+        case LiDARLoader::PointClassification::unUnclassified: return "Unclassified";
+        case LiDARLoader::PointClassification::unGround: return "Ground";
+        case LiDARLoader::PointClassification::unLowVegetation: return "Low Vegetation";
+        case LiDARLoader::PointClassification::unMediumVegetation: return "Medium Vegetation";
+        case LiDARLoader::PointClassification::unHighVegetation: return "High Vegetation";
+        case LiDARLoader::PointClassification::unBuilding: return "Building";
+        case LiDARLoader::PointClassification::unLowPointNoise: return "Low Point (Noise)";
+        case LiDARLoader::PointClassification::unReserved8: return "Reserved";
+        case LiDARLoader::PointClassification::unWater: return "Water";
+        case LiDARLoader::PointClassification::unRail: return "Rail";
+        case LiDARLoader::PointClassification::unRoadSurface: return "Road Surface";
+        case LiDARLoader::PointClassification::unReserved12: return "Reserved";
+        case LiDARLoader::PointClassification::unWireGuardShield: return "Wire – Guard (Shield)";
+        case LiDARLoader::PointClassification::unWireConductorPhase: return "Wire – Conductor (Phase)";
+        case LiDARLoader::PointClassification::unTransmissionTower: return "Transmission Tower";
+        case LiDARLoader::PointClassification::unWireStructureConnector: return "Wire-Structure Connector";
+        case LiDARLoader::PointClassification::unBridgeDeck: return "Bridge Deck";
+        case LiDARLoader::PointClassification::unHighNoise: return "High Noise";
+        case LiDARLoader::PointClassification::unOverheadStructure: return "Overhead Structure";
+        case LiDARLoader::PointClassification::unIgnoredGround: return "Ignored Ground";
+        case LiDARLoader::PointClassification::unSnow: return "Snow";
+        case LiDARLoader::PointClassification::unTemporalExclusion: return "Temporal Exclusion";
+        case LiDARLoader::PointClassification::unReserved: return "Reserved";
+        case LiDARLoader::PointClassification::unUserDefinable: return "User Definable";
     }
     return "Unknown";
 }
@@ -342,35 +342,35 @@ LiDARLoader::MinimalLASHeader LiDARLoader::ReadMinimalHeader(std::ifstream& fInp
     MinimalLASHeader stHeader{};
 
     // Read in the size of the header
-    fInput.seekg(static_cast<size_t>(LASHeaderOffset::HeaderSize), std::ios::beg);
-    fInput.read(reinterpret_cast<char*>(&stHeader.headerSize), sizeof(stHeader.headerSize));
+    fInput.seekg(static_cast<size_t>(LASHeaderOffset::siHeaderSize), std::ios::beg);
+    fInput.read(reinterpret_cast<char*>(&stHeader.unHeaderSize), sizeof(stHeader.unHeaderSize));
 
     // Read in the number of variable length records
-    fInput.seekg(static_cast<size_t>(LASHeaderOffset::NumberOfVLRs), std::ios::beg);
-    fInput.read(reinterpret_cast<char*>(&stHeader.numVLRs), sizeof(stHeader.numVLRs));
+    fInput.seekg(static_cast<size_t>(LASHeaderOffset::siNumberOfVLRs), std::ios::beg);
+    fInput.read(reinterpret_cast<char*>(&stHeader.unNumVLRs), sizeof(stHeader.unNumVLRs));
 
     // Read the entire header into a buffer
-    std::vector<char> vBuffer(stHeader.headerSize);
+    std::vector<char> vBuffer(stHeader.unHeaderSize);
     fInput.seekg(0, std::ios::beg);
     fInput.read(vBuffer.data(), vBuffer.size());
 
     // Read the relevant fields from the buffer
-    std::memcpy(&stHeader.pointDataFormat, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::Format), sizeof(stHeader.pointDataFormat));
-    std::memcpy(&stHeader.xScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::XScaleFactor), sizeof(stHeader.xScale));
-    std::memcpy(&stHeader.yScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::YScaleFactor), sizeof(stHeader.yScale));
-    std::memcpy(&stHeader.zScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::ZScaleFactor), sizeof(stHeader.zScale));
-    std::memcpy(&stHeader.xOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::XOffset), sizeof(stHeader.xOffset));
-    std::memcpy(&stHeader.yOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::YOffset), sizeof(stHeader.yOffset));
-    std::memcpy(&stHeader.zOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::ZOffset), sizeof(stHeader.zOffset));
-    std::memcpy(&stHeader.maxX, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::XMax), sizeof(stHeader.maxX));
-    std::memcpy(&stHeader.maxY, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::YMax), sizeof(stHeader.maxY));
-    std::memcpy(&stHeader.maxZ, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::ZMax), sizeof(stHeader.maxZ));
-    std::memcpy(&stHeader.minX, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::XMin), sizeof(stHeader.minX));
-    std::memcpy(&stHeader.minY, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::YMin), sizeof(stHeader.minY));
-    std::memcpy(&stHeader.minZ, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::ZMin), sizeof(stHeader.minZ));
-    std::memcpy(&stHeader.numberOfPointRecords, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::NumberOfPointRecords), sizeof(stHeader.numberOfPointRecords));
-    std::memcpy(&stHeader.offsetToPointData, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::OffsetToPointData), sizeof(stHeader.offsetToPointData));
-    std::memcpy(&stHeader.pointDataRecordLength, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::PointDataRecordLength), sizeof(stHeader.pointDataRecordLength));
+    std::memcpy(&stHeader.unPointDataFormat, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siFormat), sizeof(stHeader.unPointDataFormat));
+    std::memcpy(&stHeader.dXScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siXScaleFactor), sizeof(stHeader.dXScale));
+    std::memcpy(&stHeader.dYScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siYScaleFactor), sizeof(stHeader.dYScale));
+    std::memcpy(&stHeader.dZScale, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siZScaleFactor), sizeof(stHeader.dZScale));
+    std::memcpy(&stHeader.dXOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siXOffset), sizeof(stHeader.dXOffset));
+    std::memcpy(&stHeader.dYOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siYOffset), sizeof(stHeader.dYOffset));
+    std::memcpy(&stHeader.dZOffset, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siZOffset), sizeof(stHeader.dZOffset));
+    std::memcpy(&stHeader.dMaxX, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siXMax), sizeof(stHeader.dMaxX));
+    std::memcpy(&stHeader.dMaxY, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siYMax), sizeof(stHeader.dMaxY));
+    std::memcpy(&stHeader.dMaxZ, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siZMax), sizeof(stHeader.dMaxZ));
+    std::memcpy(&stHeader.dMinX, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siXMin), sizeof(stHeader.dMinX));
+    std::memcpy(&stHeader.dMinY, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siYMin), sizeof(stHeader.dMinY));
+    std::memcpy(&stHeader.dMinZ, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siZMin), sizeof(stHeader.dMinZ));
+    std::memcpy(&stHeader.unNumberOfPointRecords, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siNumberOfPointRecords), sizeof(stHeader.unNumberOfPointRecords));
+    std::memcpy(&stHeader.unOffsetToPointData, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siOffsetToPointData), sizeof(stHeader.unOffsetToPointData));
+    std::memcpy(&stHeader.unPointRecordLength, vBuffer.data() + static_cast<size_t>(LASHeaderOffset::siPointDataRecordLength), sizeof(stHeader.unPointRecordLength));
 
     // Return the simplified header
     return stHeader;
@@ -397,12 +397,12 @@ LiDARLoader::MinimalLASHeader LiDARLoader::ReadMinimalHeader(std::ifstream& fInp
 std::pair<int, char> LiDARLoader::ExtractUTMZoneFromVLR1(std::ifstream& fInput, const MinimalLASHeader& stHeader)
 {
     // 1) Seek to the first VLR, which lives at byte offset = headerSize
-    fInput.seekg(stHeader.headerSize, std::ios::beg);
+    fInput.seekg(stHeader.unHeaderSize, std::ios::beg);
 
     // 2) Read the VLR header
     VLRHeader stVLRHeader;
     fInput.read(reinterpret_cast<char*>(&stVLRHeader), sizeof(stVLRHeader));
-    std::vector<char> payload(stVLRHeader.recordLengthAfterHeader);
+    std::vector<char> payload(stVLRHeader.unRecordLengthAfterHeader);
     fInput.read(payload.data(), payload.size());
 
     // 3) Convert payload to string and search for UTM zone and hemisphere
@@ -448,13 +448,13 @@ std::pair<int, char> LiDARLoader::ExtractUTMZoneFromVLR1(std::ifstream& fInput, 
 std::vector<LiDARLoader::PointRow> LiDARLoader::CollectPointRecords(std::ifstream& fInput, const MinimalLASHeader& stHeader, std::pair<int, char> stdUTMZone)
 {
     // 1) Read the point data record length and reserve space for the rows
-    fInput.seekg(stHeader.offsetToPointData, std::ios::beg);
-    std::vector<char> vBuffer(stHeader.pointDataRecordLength);
+    fInput.seekg(stHeader.unOffsetToPointData, std::ios::beg);
+    std::vector<char> vBuffer(stHeader.unPointRecordLength);
     std::vector<PointRow> vPointRows;
-    vPointRows.reserve(stHeader.numberOfPointRecords);
+    vPointRows.reserve(stHeader.unNumberOfPointRecords);
 
     // 2) Read each point record
-    for (uint64_t unIndex = 0; unIndex < stHeader.numberOfPointRecords; ++unIndex)
+    for (uint64_t unIndex = 0; unIndex < stHeader.unNumberOfPointRecords; ++unIndex)
     {
         // 2a) Read the point data into the buffer
         fInput.read(vBuffer.data(), vBuffer.size());
@@ -472,9 +472,9 @@ std::vector<LiDARLoader::PointRow> LiDARLoader::CollectPointRecords(std::ifstrea
         std::string szCLS = MakeClassification(static_cast<uint8_t>(vBuffer[16]));
 
         // 2d) Scale and offset the coordinates
-        double dEasting  = nRawX * stHeader.xScale + stHeader.xOffset;
-        double dNorthing = nRawY * stHeader.yScale + stHeader.yOffset;
-        double dAltitude = nRawZ * stHeader.zScale + stHeader.zOffset;
+        double dEasting  = nRawX * stHeader.dXScale + stHeader.dXOffset;
+        double dNorthing = nRawY * stHeader.dYScale + stHeader.dYOffset;
+        double dAltitude = nRawZ * stHeader.dZScale + stHeader.dZOffset;
 
         // 2e) Create a PointRow object and add it to the vector
         vPointRows.push_back({dEasting, dNorthing, dAltitude, stdUTMZone, szCLS});
@@ -510,7 +510,7 @@ bool LiDARLoader::CreateDB(const std::string& szDBPath)
         return false;
     }
 
-    const char* createRawPointsTableSQL  = R"(
+    const char* szCreateRawPointsTableSQL  = R"(
         CREATE TABLE IF NOT EXISTS RawPoints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             Easting REAL NOT NULL,
@@ -521,12 +521,12 @@ bool LiDARLoader::CreateDB(const std::string& szDBPath)
         );
     )";
 
-    const char* createRawPointsIndexsSQL = R"(
+    const char* szCreateRawPointsIndexsSQL = R"(
         CREATE INDEX IF NOT EXISTS idx_Easting_Northing ON RawPoints (Easting, Northing);
     )";
 
-    char* szErrMsg                       = nullptr;
-    if (sqlite3_exec(sqlDatabase, createRawPointsTableSQL, nullptr, nullptr, &szErrMsg) != SQLITE_OK)
+    char* szErrMsg                         = nullptr;
+    if (sqlite3_exec(sqlDatabase, szCreateRawPointsTableSQL, nullptr, nullptr, &szErrMsg) != SQLITE_OK)
     {
         std::cerr << "Failed to create table: " << szErrMsg << "\n";
         sqlite3_free(szErrMsg);
@@ -534,7 +534,7 @@ bool LiDARLoader::CreateDB(const std::string& szDBPath)
         return false;
     }
 
-    if (sqlite3_exec(sqlDatabase, createRawPointsIndexsSQL, nullptr, nullptr, &szErrMsg) != SQLITE_OK)
+    if (sqlite3_exec(sqlDatabase, szCreateRawPointsIndexsSQL, nullptr, nullptr, &szErrMsg) != SQLITE_OK)
     {
         std::cerr << "Failed to create index: " << szErrMsg << "\n";
         sqlite3_free(szErrMsg);
@@ -613,13 +613,13 @@ int LiDARLoader::PopulateSQL(const std::vector<PointRow>& vPointRows, const std:
     {
         // 5a) Bind parameters
         const LiDARLoader::PointRow& stPointRow = vPointRows[siIndex];
-        sqlite3_bind_double(sqlStatement, 1, stPointRow.easting);
-        sqlite3_bind_double(sqlStatement, 2, stPointRow.northing);
-        sqlite3_bind_double(sqlStatement, 3, stPointRow.altitude);
+        sqlite3_bind_double(sqlStatement, 1, stPointRow.dEasting);
+        sqlite3_bind_double(sqlStatement, 2, stPointRow.dNorthing);
+        sqlite3_bind_double(sqlStatement, 3, stPointRow.dAltitude);
 
-        std::string szZoneStr = std::to_string(stPointRow.zone.first) + stPointRow.zone.second;
+        std::string szZoneStr = std::to_string(stPointRow.stdZone.first) + stPointRow.stdZone.second;
         sqlite3_bind_text(sqlStatement, 4, szZoneStr.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(sqlStatement, 5, stPointRow.classification.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sqlStatement, 5, stPointRow.szClassification.c_str(), -1, SQLITE_TRANSIENT);
 
         // 5b) Execute & reset
         sqlite3_step(sqlStatement);
@@ -686,9 +686,9 @@ unsigned long long LiDARLoader::LoadAndExportData(const std::string& szFilename,
 
     // 4) Collect point records
     std::vector<LiDARLoader::PointRow> vPointRows = CollectPointRecords(fInput, stHeader, {stdUTM.first, stdUTM.second});
-    if (vPointRows.size() != stHeader.numberOfPointRecords)
+    if (vPointRows.size() != stHeader.unNumberOfPointRecords)
     {
-        std::cerr << "Warning: Only " << vPointRows.size() << " points out of " << stHeader.numberOfPointRecords << "\n";
+        std::cerr << "Warning: Only " << vPointRows.size() << " points out of " << stHeader.unNumberOfPointRecords << "\n";
         return 0;
     }
 
