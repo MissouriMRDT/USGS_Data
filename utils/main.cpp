@@ -60,7 +60,9 @@ int main(int argc, char** argv)
         for (const std::filesystem::directory_entry& fsEntry : std::filesystem::directory_iterator(fsInputPath))
         {
             if (fsEntry.is_regular_file() && fsEntry.path().extension() == ".las")
+            {
                 vLASFiles.push_back(fsEntry.path());
+            }
         }
 
         // 3b) Check if no .las files were found and exit if so
@@ -78,30 +80,32 @@ int main(int argc, char** argv)
             std::cerr << "Not a .las file: " << fsInputPath << "\n";
             return 1;
         }
+
+        // 3d) Add the .las file to the vector
         vLASFiles.push_back(fsInputPath);
     }
 
     // 4) Create a LiDARLoader instance
-    LiDARLoader loader;
+    LiDARLoader pLoader;
 
     // 5) Start overall timer
     std::chrono::time_point<std::chrono::steady_clock> tOverallStart = std::chrono::steady_clock::now();
 
     // 6) Iterate through each .las file and process it
-    for (const std::filesystem::path& lasPath : vLASFiles)
+    for (const std::filesystem::path& fsLASPath : vLASFiles)
     {
         // 6a) Start per-file timer
-        std::cout << "Processing: " << lasPath << " ...\n";
+        std::cout << "Processing: " << fsLASPath << " ...\n";
         std::chrono::time_point<std::chrono::steady_clock> tFileStart = std::chrono::steady_clock::now();
 
         // 6b) Load and export data from the LAS file
         try
         {
-            loader.LoadAndExportData(lasPath.string(), szDBPath);
+            pLoader.LoadAndExportData(fsLASPath.string(), szDBPath);
         }
-        catch (const std::exception& e)
+        catch (const std::exception& stdException)
         {
-            std::cerr << "Error processing " << lasPath << ": " << e.what() << "\n";
+            std::cerr << "Error processing " << fsLASPath << ": " << stdException.what() << "\n";
             continue;
         }
 

@@ -68,11 +68,11 @@ class LiDARLoader
          ******************************************************************************/
         struct PointRow
         {
-                double easting;
-                double northing;
-                double altitude;
-                std::pair<int, char> zone;
-                std::string classification;
+                double dEasting;
+                double dNorthing;
+                double dAltitude;
+                std::pair<int, char> stdZone;
+                std::string szClassification;
         };
 
         ////////////////////////////////////
@@ -119,7 +119,7 @@ class LiDARLoader
         MinimalLASHeader ReadMinimalHeader(std::ifstream& fInput);
         std::pair<int, char> ExtractUTMZoneFromVLR1(std::ifstream& fInput, const MinimalLASHeader& stHeader);
         std::vector<PointRow> CollectPointRecords(std::ifstream& fInput, const MinimalLASHeader& stHeader, std::pair<int, char> stdUTMZone);
-        bool CreateDB(const std::string& dbPath);
+        bool CreateDB(const std::string& szDBPath);
         int PopulateSQL(const std::vector<PointRow>& vPointRows, const std::string& szDBPath);
 };
 
