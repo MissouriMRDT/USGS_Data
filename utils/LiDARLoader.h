@@ -29,7 +29,20 @@
 #define LIDARLOADER_H
 
 /// \cond
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <regex>
+#include <sqlite3.h>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -105,6 +118,7 @@ class LiDARLoader
         // Public Methods
         ////////////////////////////////////
         unsigned long long LoadAndExportData(const std::string& szFilename, const std::string& szDBPath);
+        void ComputeGridRoughness(const std::string& dbPath, double gridSize, double globalRadius);
 
     private:
         ////////////////////////////////////
@@ -121,6 +135,12 @@ class LiDARLoader
         std::vector<PointRow> CollectPointRecords(std::ifstream& fInput, const MinimalLASHeader& stHeader, std::pair<int, char> stdUTMZone);
         bool CreateDB(const std::string& szDBPath);
         int PopulateSQL(const std::vector<PointRow>& vPointRows, const std::string& szDBPath);
+        std::vector<std::array<double, 3>> GetNearbyPoints(int nCx,
+                                                           int nCy,
+                                                           const std::map<std::pair<int, int>, std::vector<std::array<double, 3>>>& mGridBuckets,
+                                                           double dGridSize,
+                                                           double dRadius);
+        double ComputePlaneFitRMSError(const std::vector<std::array<double, 3>>& vPoints);
 };
 
 #endif

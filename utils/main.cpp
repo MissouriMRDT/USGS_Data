@@ -120,6 +120,34 @@ int main(int argc, char** argv)
     std::chrono::duration<double> tOverallDuration                 = tOverallEnd - tOverallStart;
     std::cout << "Total processing time: " << tOverallDuration.count() << " seconds for " << vLASFiles.size() << " file(s)\n";
 
-    // 8) Return success
+    // 8) Start Timer for roughness computation
+    std::chrono::time_point<std::chrono::steady_clock> tRoughnessStart = std::chrono::steady_clock::now();
+
+    // 9) Compute and store roughness
+    try
+    {
+        std::cout << "Starting roughness computation...\n";
+
+        double dCellArea      = 1.0;    // Local Square Area (meters)
+        double dTerrainRadius = 2.5;    // Global Square Radius (meters)
+
+        LiDARLoader().ComputeGridRoughness(szDBPath, dCellArea, dTerrainRadius);
+
+        std::cout << "Finished computing roughness.\n";
+    }
+    catch (const std::exception& stdException)
+    {
+        std::cerr << "Error processing " << stdException.what() << "\n";
+    }
+
+    // 10) Stop Timer for roughness computation and print duration
+    std::chrono::time_point<std::chrono::steady_clock> tRoughnessEnd = std::chrono::steady_clock::now();
+    std::chrono::time_point<std::chrono::steady_clock> tOverallEnd2  = std::chrono::steady_clock::now();
+    std::chrono::duration<double> tRoughnessDuration                 = tRoughnessEnd - tRoughnessStart;
+    std::chrono::duration<double> tOverallDuration2                  = tOverallEnd2 - tOverallStart;
+    std::cout << "Roughness computation time: " << tRoughnessDuration.count() << " seconds\n";
+    std::cout << "================================================\nTotal processing time: " << tOverallDuration2.count()
+              << " seconds\n================================================\n";
+
     return 0;
 }

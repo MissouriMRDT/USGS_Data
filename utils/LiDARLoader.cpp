@@ -20,15 +20,20 @@
  ******************************************************************************/
 
 /// \cond
+#include <atomic>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <regex>
 #include <sqlite3.h>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 /// \endcond
 
@@ -697,4 +702,335 @@ unsigned long long LiDARLoader::LoadAndExportData(const std::string& szFilename,
 
     // 6) Return the number of points loaded
     return vPointRows.size();
+}
+
+/******************************************************************************
+ * @brief Gathers all points within a specified radius of a grid cell center.
+ *
+ * This function takes a center grid cell coordinate (nCx, nCy) and searches for all points
+ * in neighboring grid cells (from the `mGridBuckets` map) that fall within a circular region
+ * of radius `dRadius` centered at the physical center of the cell:
+ *
+ *     dCenterX = (nCx + 0.5) * dGridSize
+ *     dCenterY = (nCy + 0.5) * dGridSize
+ *
+ * For efficiency, only grid cells within a bounding square of side `2 * dRadius` are examined,
+ * where `dRange = std::ceil(dRadius / dGridSize)`. Each point from the neighboring cells is tested
+ * for Euclidean distance to the center, and only those within `dRadius` are included.
+ *
+ * This method is used to gather neighborhood context for plane fitting in terrain roughness analysis.
+ *
+ * @param nCx           X-index of the center grid cell.
+ * @param nCy           Y-index of the center grid cell.
+ * @param mGridBuckets  Map of grid cells to their contained (Easting, Northing, Altitude) points.
+ * @param dGridSize     The physical size of each grid cell in meters.
+ * @param dRadius       The radius in meters to search from the center of the grid cell.
+ * @return std::vector<std::array<double, 3>> - 3D points (each as {easting, northing, altitude}) within the radius.
+ *
+ * @author Eli Byrd (edbgkk@mst.edu)
+ * @date 2025-05-21
+ ******************************************************************************/
+std::vector<std::array<double, 3>> LiDARLoader::GetNearbyPoints(int nCx,
+                                                                int nCy,
+                                                                const std::map<std::pair<int, int>, std::vector<std::array<double, 3>>>& mGridBuckets,
+                                                                double dGridSize,
+                                                                double dRadius)
+{
+    // 1) Create a vector to hold nearby points
+    std::vector<std::array<double, 3>> vNearby;
+
+    // 2) Calculate the center of the grid cell
+    double dCenterEasting  = (nCx + 0.5) * dGridSize;
+    double dCenterNorthing = (nCy + 0.5) * dGridSize;
+
+    // 3) Calculate the squared radius and range
+    double dRadiusSq = dRadius * dRadius;
+
+    // 4) Determine the range of grid cells to check
+    int nRange = static_cast<int>(std::ceil(dRadius / dGridSize));
+
+    // 5) Iterate over the neighboring grid cells
+    for (int nDx = -nRange; nDx <= nRange; ++nDx)
+    {
+        for (int nDy = -nRange; nDy <= nRange; ++nDy)
+        {
+            // 5a) Find the grid cell at (nCx + nDx, nCy + nDy) in the map if it exists; skip if not found
+            std::map<std::pair<int, int>, std::vector<std::array<double, 3>>>::const_iterator stdIterator = mGridBuckets.find({nCx + nDx, nCy + nDy});
+            if (stdIterator == mGridBuckets.end())
+            {
+                continue;
+            }
+
+            // 5b) Iterate over the points in the found grid cell
+            for (const std::array<double, 3>& aPoint : stdIterator->second)
+            {
+                // 5bi) Find the distance from the point to the center of the grid cell
+                double dDeltaEasting  = aPoint[0] - dCenterEasting;
+                double dDeltaNorthing = aPoint[1] - dCenterNorthing;
+
+                // 5bii) If the point is within the radius, add it to the nearby points vector
+                if (dDeltaEasting * dDeltaEasting + dDeltaNorthing * dDeltaNorthing <= dRadiusSq)
+                {
+                    vNearby.push_back(aPoint);
+                }
+            }
+        }
+    }
+
+    // 6) Return the vector of nearby points
+    return vNearby;
+}
+
+/******************************************************************************
+ * @brief Computes the RMS error of a least-squares plane fit to a set of 3D points.
+ *
+ * This function fits a plane of the form:
+ *      z = a * x + b * y + c
+ * to a given set of 3D points using least-squares regression, and returns the
+ * root-mean-square (RMS) error between the actual Z values and the fitted plane.
+ *
+ * The fit is computed by minimizing the squared vertical (Z-axis) distance between
+ * each point and the estimated plane at that X,Y location. It is useful for evaluating
+ * the local flatness or roughness of a terrain patch.
+ *
+ * Special cases:
+ * - If fewer than 3 points are provided, the function returns -1.0 (not enough data).
+ * - If the least-squares system is degenerate (determinant near zero), it also returns -1.0.
+ *
+ * @param vPoints A vector of 3D points, where each point is an array {x, y, z}.
+ * @return double - The RMS error of the plane fit, or -1.0 if the fit is invalid.
+ *
+ * @author Eli Byrd (edbgkk@mst.edu)
+ * @date 2025-05-21
+ ******************************************************************************/
+double LiDARLoader::ComputePlaneFitRMSError(const std::vector<std::array<double, 3>>& vPoints)
+{
+    if (vPoints.size() < 3)
+    {
+        return -1.0;
+    }
+
+    double dSumX  = 0;
+    double dSumY  = 0;
+    double dSumZ  = 0;
+    double dSumXX = 0;
+    double dSumXY = 0;
+    double dSumXZ = 0;
+    double dSumYY = 0;
+    double dSumYZ = 0;
+
+    for (const std::array<double, 3>& aPoint : vPoints)
+    {
+        double dX = aPoint[0];
+        double dY = aPoint[1];
+        double dZ = aPoint[2];
+
+        dSumX += dX;
+        dSumY += dY;
+        dSumZ += dZ;
+
+        dSumXX += dX * dX;
+        dSumXY += dX * dY;
+        dSumXZ += dX * dZ;
+        dSumYY += dY * dY;
+        dSumYZ += dY * dZ;
+    }
+
+    size_t siNumPoints     = vPoints.size();
+    double dFitDenominator = dSumXX * dSumYY - dSumXY * dSumXY;
+    if (std::abs(dFitDenominator) < 1e-8)
+    {
+        return -1.0;
+    }
+
+    double dSlopeZToX        = (dSumYY * dSumXZ - dSumXY * dSumYZ) / dFitDenominator;
+    double dSlopeZToY        = (dSumXX * dSumYZ - dSumXY * dSumXZ) / dFitDenominator;
+    double dPlaneOffset      = (dSumZ - dSlopeZToX * dSumX - dSlopeZToY * dSumY) / siNumPoints;
+
+    double dRMSPlaneFitError = 0.0;
+    for (const std::array<double, 3>& aPoint : vPoints)
+    {
+        double dX   = aPoint[0];
+        double dY   = aPoint[1];
+        double dZ   = aPoint[2];
+        double zFit = dSlopeZToX * dX + dSlopeZToY * dY + dPlaneOffset;
+        dRMSPlaneFitError += (dZ - zFit) * (dZ - zFit);
+    }
+
+    return std::sqrt(dRMSPlaneFitError / siNumPoints);
+}
+
+/******************************************************************************
+ * @brief Computes local and global terrain roughness from LiDAR point data and stores it in an SQLite database.
+ *
+ * This function reads (Easting, Northing, Altitude) values from the 'RawPoints' table in the specified SQLite database.
+ * It divides the XY space into uniform grid cells of size `gridSize`, mapping each point to a grid coordinate:
+ *
+ *     gridX = floor(Easting  / gridSize)
+ *     gridY = floor(Northing / gridSize)
+ *
+ * For each populated grid cell:
+ *
+ * - **Local Roughness** is calculated by fitting a least-squares plane to the points in that cell.
+ *   The RMS error between actual Z-values and the plane estimates is used as a roughness metric.
+ *
+ * - **Global Roughness** is computed by gathering all points within `globalRadius` meters of the center of the current grid cell.
+ *   These points are also used to fit a plane, and the resulting RMS error quantifies terrain variation in the wider area.
+ *
+ * If a plane fit fails due to too few points (<3) or a degenerate configuration (singular matrix), the corresponding roughness
+ * value is skipped or set to a high sentinel value (e.g., 1000.0) to mark it as unfavorable for traversal.
+ *
+ * Results are stored in a table named 'GridRoughness' with columns:
+ *     - GridX, GridY: Grid coordinates
+ *     - Roughness: Local roughness (RMS from the cell's own points)
+ *     - TerrainRadius: RMS using surrounding points within `dTerrainRadius`
+ *
+ * This method is efficient for terrain classification, path planning, and drivability assessment in mobile robotics.
+ *
+ * @param szDBPath        Path to the SQLite database.
+ * @param dGridSize       Size of each grid cell in meters.
+ * @param dTerrainRadius  Radius (in meters) around each cell center to use for computing global roughness.
+ *
+ * @author Eli Byrd (edbgkk@mst.edu)
+ * @date 2025-05-21
+ ******************************************************************************/
+void LiDARLoader::ComputeGridRoughness(const std::string& szDBPath, double dGridSize, double dTerrainRadius)
+{
+    // 1) Open the database; return if it fails
+    sqlite3* sqlDatabase = nullptr;
+    if (sqlite3_open(szDBPath.c_str(), &sqlDatabase) != SQLITE_OK)
+    {
+        std::cerr << "Failed to open database: " << sqlite3_errmsg(sqlDatabase) << "\n";
+        return;
+    }
+
+    // 2) Enable foreign key constraints
+    sqlite3_exec(sqlDatabase, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
+
+    // 3) Create the GridRoughness table if it doesn't exist
+    const char* szCreateTableSQL = R"(
+        CREATE TABLE IF NOT EXISTS GridRoughness (
+            GridX INTEGER NOT NULL,
+            GridY INTEGER NOT NULL,
+            CellRoughness REAL NOT NULL,
+            TerrainRoughness REAL NOT NULL,
+            PRIMARY KEY(GridX, GridY)
+        );
+    )";
+    if (sqlite3_exec(sqlDatabase, szCreateTableSQL, nullptr, nullptr, nullptr) != SQLITE_OK)
+    {
+        std::cerr << "Failed to create GridRoughness table.\n";
+        sqlite3_close(sqlDatabase);
+        return;
+    }
+
+    // 4) Prepare the lookup for the RawPoints table
+    sqlite3_stmt* sqlStatementPoints = nullptr;
+    const char* szFetchPointsSQL     = R"(SELECT Easting, Northing, Altitude FROM RawPoints;)";
+    if (sqlite3_prepare_v2(sqlDatabase, szFetchPointsSQL, -1, &sqlStatementPoints, nullptr) != SQLITE_OK)
+    {
+        std::cerr << "Failed to prepare point fetch statement.\n";
+        sqlite3_close(sqlDatabase);
+        return;
+    }
+
+    // 5) Create a map to hold grid buckets
+    std::map<std::pair<int, int>, std::vector<std::array<double, 3>>> mGridBuckets;
+
+    // 6) Read points from the database and bucket them into grid cells
+    while (sqlite3_step(sqlStatementPoints) == SQLITE_ROW)
+    {
+        // 6a) Read the point data
+        double dEasting  = sqlite3_column_double(sqlStatementPoints, 0);
+        double dNorthing = sqlite3_column_double(sqlStatementPoints, 1);
+        double dAltitude = sqlite3_column_double(sqlStatementPoints, 2);
+
+        // 6b) Compute the grid cell coordinates
+        int nGridX = static_cast<int>(std::floor(dEasting / dGridSize));
+        int nGridY = static_cast<int>(std::floor(dNorthing / dGridSize));
+
+        // 6c) Insert the point into the appropriate grid bucket
+        mGridBuckets[{nGridX, nGridY}].emplace_back(std::array<double, 3>{dEasting, dNorthing, dAltitude});
+    }
+    // 7) Finalize the statement and close the database
+    sqlite3_finalize(sqlStatementPoints);
+
+    // 8) Prepare the lookup for the GridRoughness table
+    sqlite3_stmt* sqlStatementCheck = nullptr;
+    const char* szCheckSQL          = R"(SELECT 1 FROM GridRoughness WHERE GridX = ? AND GridY = ?;)";
+    sqlite3_prepare_v2(sqlDatabase, szCheckSQL, -1, &sqlStatementCheck, nullptr);
+
+    // 9) Prepare the insert statement for GridRoughness
+    sqlite3_stmt* sqlStatementInsert = nullptr;
+    const char* szInsertSQL          = R"(INSERT INTO GridRoughness (GridX, GridY, CellRoughness, TerrainRoughness) VALUES (?, ?, ?, ?);)";
+    sqlite3_prepare_v2(sqlDatabase, szInsertSQL, -1, &sqlStatementInsert, nullptr);
+
+    // 10) Begin a transaction for performance
+    sqlite3_exec(sqlDatabase, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+
+    // 11) Iterate over the grid buckets and compute roughness
+    size_t siInsertedCount = 0;
+    for (const std::pair<const std::pair<int, int>, std::vector<std::array<double, 3>>>& pGridBucket : mGridBuckets)
+    {
+        // 11a) Get the grid and points
+        const std::pair<int, int>& pGrid                  = pGridBucket.first;
+        const std::vector<std::array<double, 3>>& vPoints = pGridBucket.second;
+
+        // 11b) Find the grid coordinates
+        int nGridX = pGrid.first;
+        int nGridY = pGrid.second;
+
+        // 11c) Check if the grid cell already exists in the database; skip if it does
+        sqlite3_reset(sqlStatementCheck);
+        sqlite3_bind_int(sqlStatementCheck, 1, nGridX);
+        sqlite3_bind_int(sqlStatementCheck, 2, nGridY);
+        if (sqlite3_step(sqlStatementCheck) == SQLITE_ROW)
+        {
+            std::cerr << "Grid cell (" << nGridX << ", " << nGridY << ") already exists in the database.\n";
+            continue;
+        }
+
+        // 11d) Compute the local roughness using a plane fit; set to 10.0 if it fails (the maximum roughness value)
+        double dRMSCellPlaneFitError = ComputePlaneFitRMSError(vPoints);
+        if (dRMSCellPlaneFitError < 0 || dRMSCellPlaneFitError > 10.0)
+        {
+            dRMSCellPlaneFitError = 10.0;
+        }
+
+        // 11e) Find the nearby points for global roughness
+        const std::vector<std::array<double, 3>> vNearbyPts = GetNearbyPoints(nGridX, nGridY, mGridBuckets, dGridSize, dTerrainRadius);
+
+        // 11f) Compute the global roughness using a plane fit; set to 10.0 if it fails (the maximum roughness value)
+        double dRMSTerrainPlaneFitError = ComputePlaneFitRMSError(vNearbyPts);
+        if (dRMSTerrainPlaneFitError < 0 || dRMSTerrainPlaneFitError > 10.0)
+        {
+            dRMSTerrainPlaneFitError = 10.0;
+        }
+
+        // 11g) Insert the grid cell roughness into the database
+        sqlite3_reset(sqlStatementInsert);
+        sqlite3_bind_int(sqlStatementInsert, 1, nGridX);
+        sqlite3_bind_int(sqlStatementInsert, 2, nGridY);
+        sqlite3_bind_double(sqlStatementInsert, 3, dRMSCellPlaneFitError);
+        sqlite3_bind_double(sqlStatementInsert, 4, dRMSTerrainPlaneFitError);
+        sqlite3_step(sqlStatementInsert);
+
+        // 11h) Commit every 500 rows for performance
+        if (++siInsertedCount % 1000 == 0)
+        {
+            std::cout << "Inserted " << siInsertedCount << " grid cells...\n";
+
+            sqlite3_exec(sqlDatabase, "END TRANSACTION;", nullptr, nullptr, nullptr);
+            sqlite3_exec(sqlDatabase, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+        }
+    }
+
+    // 12) Finalize the statements and commit the transaction
+    sqlite3_exec(sqlDatabase, "END TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_finalize(sqlStatementCheck);
+    sqlite3_finalize(sqlStatementInsert);
+    sqlite3_close(sqlDatabase);
+
+    // 13) Output the number of inserted grid cells
+    std::cout << "Finished computing grid-based roughness for " << siInsertedCount << " regions.\n";
 }
