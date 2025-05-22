@@ -28,3 +28,21 @@ utils/lidar_loader
 *~
 *.swp
 *.bak
+
+# ──────────────
+# Log Files
+# ──────────────
+
+*.csv
+*.log
+*.txt
+
+# ──────────────
+# Data Files
+# ──────────────
+
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
