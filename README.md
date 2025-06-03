@@ -1,7 +1,9 @@
 # USGS_Data  
 *A LiDAR Preprocessing Tool by the Missouri S&T Mars Rover Design Team*
 
-This repository provides a C++ utility for converting raw USGS **LAS 1.4** LiDAR files into a structured **SQLite database**. It is designed to support autonomous navigation, terrain simulation, and mission planning tasks by making point cloud data queryable and region-aware.
+![LiDAR Point Cloud Visualization](res/Rolla_Fugitive2.png)
+
+This repository provides Python utilities for converting raw USGS **LAS 1.4** LiDAR files into a structured **SQLite database**. It is designed to support autonomous navigation, terrain simulation, and mission planning tasks by making point cloud data queryable and region-aware.
 
 ---
 
@@ -12,12 +14,17 @@ This repository provides a C++ utility for converting raw USGS **LAS 1.4** LiDAR
 USGS_Data/
 ├── data/
 │   ├── las/            # Raw USGS .las files organized by region
-│   │   └── MDRS/       # Example: Mars Desert Research Station dataset
+│   │   ├── MDRS/       # Example: Mars Desert Research Station laz files
+|   |   ├── Fugitive/   # Example: Fugitive Beach laz files
+|   |   └── SDELC/      # Example: General Rolla laz files (Golf Course, Turf Fields, SDELC, etc)
 │   └── sqlite/         # Output SQLite databases (e.g., MDRS.db)
 ├── utils/
-│   ├── LiDARLoader.cpp # LAS → SQLite core logic
-│   ├── LiDARLoader.h   # Class definition and LAS structures
-│   └── main.cpp        # Command-line interface entry point
+|   ├── plan_and_plot.py # Load a created database and plan a path using the trav_score
+│   ├── lidar_preprocess.py  # LAS → SQLite core logic
+|   ├── lidar_explorer.py # Open3D viewer of lidar data from the created database
+│   └── main.py        # Command-line interface entry point
+├── res/                # Directory for images and resources
+│   └── *.png # Example image file
 ├── .gitattributes
 ├── .gitignore
 └── README.md
@@ -29,41 +36,18 @@ USGS_Data/
 
 ### 🔧 Build the Tool
 
-Make sure you have `g++` and `libsqlite3-dev` installed:
+Make sure you have `python3` and `libsqlite3-dev` installed:
 
 ```bash
 sudo apt update
-sudo apt install g++ libsqlite3-dev
+sudo apt install python3 libsqlite3-dev
 ````
 
-Then compile the loader:
+Then install the required Python packages from the Pipfile:
 
 ```bash
-g++ -std=c++17 -O2 \
-    utils/main.cpp utils/LiDARLoader.cpp \
-    -lsqlite3 -o utils/lidar_loader
+pipenv install
 ```
-
----
-
-## ▶️ Running the Tool
-
-You must provide:
-
-1. A path to a single `.las` file **or** a directory containing multiple `.las` files
-2. A path to the output `.db` file
-
-```bash
-./utils/lidar_loader <input.las | input_directory/> <output_database.db>
-```
-
-### ✅ Example
-
-```bash
-./utils/lidar_loader data/las/MDRS/ data/sqlite/MDRS.db
-```
-
-All point data will be loaded into the `RawPoints` table inside `MDRS.db`.
 
 ---
 
@@ -77,21 +61,6 @@ All point data will be loaded into the `RawPoints` table inside `MDRS.db`.
   * UTM Zone
   * Point Classification (human-readable)
 * ✔️ Automatically creates indexes and batches inserts for performance
-
----
-
-## 🗃️ Table Schema: `RawPoints`
-
-| Column           | Type    | Description                           |
-| ---------------- | ------- | ------------------------------------- |
-| `id`             | INTEGER | Auto-increment primary key            |
-| `Easting`        | REAL    | Scaled X position                     |
-| `Northing`       | REAL    | Scaled Y position                     |
-| `Altitude`       | REAL    | Scaled Z position                     |
-| `Zone`           | TEXT    | UTM zone (e.g. `12N`)                 |
-| `Classification` | TEXT    | Point class (e.g. Ground, Water, etc) |
-
-An index on `(Easting, Northing)` is automatically created.
 
 ---
 
