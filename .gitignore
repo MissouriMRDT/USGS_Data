@@ -22,6 +22,13 @@ utils/lidar_loader
 *.db-shm
 
 # ──────────────
+# Database Files
+# ──────────────
+
+# Ignore SQLite database files due to their size
+*.db
+
+# ──────────────
 # Editor/Backup Files
 # ──────────────
 
