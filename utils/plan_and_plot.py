@@ -70,12 +70,12 @@ def load_points(db_path, xmin, xmax, ymin, ymax, score_thresh=0.0):
 def dijkstra_biased(coords_xy, scores, start_idx, end_idx, k=8, 
                     penalty_factor=5.0):
     """
-    Run Dijkstra’s algorithm on a graph of LiDAR points, where edge cost
+    Run Dijkstra's algorithm on a graph of LiDAR points, where edge cost
     = distance(i,j) * (1 + penalty_factor*(1 - scores[j])).
     
     Args:
     -----
-    coords_xy: (N×2) array of (easting, northing)
+    coords_xy: (Nx2) array of (easting, northing)
     scores:   (N)     array of trav_score in [0,1]
     start_idx, end_idx: indices into coords_xy
     k: number of nearest neighbors per node
@@ -141,7 +141,7 @@ def find_nearest_index(coords_xy, point_xy):
 
     Args:
     -----
-    coords_xy: (N×2) array of (easting, northing)
+    coords_xy: (Nx2) array of (easting, northing)
     point_xy: tuple of (easting, northing) to find nearest to
 
     Returns:
@@ -152,15 +152,19 @@ def find_nearest_index(coords_xy, point_xy):
     _, idx = tree.query(point_xy)
     return idx
 
-def plot_terrain_and_path(coords, scores, path_indices, output_file=None):
+def plot_terrain_and_path(coords, scores, path_indices, margin=None, score_thresh=None, k=None, beta=None, output_file=None):
     """
     3D plot of terrain (colored by trav_score) and overlay the path in cyan.
 
     Args:
     -----
-    coords: (N×3) array of (easting, northing, altitude)
+    coords: (Nx3) array of (easting, northing, altitude)
     scores: (N) array of trav_score values
     path_indices: list of indices forming the path
+    margin: float, margin around start/end points (for info box)
+    score_thresh: float, minimum trav_score to include in plot
+    k: int, number of nearest neighbors used in Dijkstra
+    beta: float, penalty factor β for 1 - trav_score
     output_file: str, if set, save the plot to this PNG file
 
     Returns:
@@ -205,6 +209,34 @@ def plot_terrain_and_path(coords, scores, path_indices, output_file=None):
             zorder=11
         )
 
+        start_coord = path_coords[0]
+        end_coord = path_coords[-1]
+        
+        # START
+        ax.plot(
+            [start_coord[0]], [start_coord[1]], [start_coord[2]],
+            marker='o',
+            color='gold',
+            markersize=5,
+            markeredgecolor='black',
+            markeredgewidth=1.5,
+            zorder=30,
+            label=f'Start: ({start_coord[0]:.2f}, {start_coord[1]:.2f})'
+        )
+
+        # END
+        ax.plot(
+            [end_coord[0]], [end_coord[1]], [end_coord[2]],
+            marker='o',
+            color='magenta',
+            markersize=5,
+            markeredgecolor='black',
+            markeredgewidth=1.5,
+            zorder=30,
+            label=f'End: ({end_coord[0]:.2f}, {end_coord[1]:.2f})'
+        )
+
+
     ax.set_xlabel('Easting (m)')
     ax.set_ylabel('Northing (m)')
     ax.set_zlabel('Altitude (m)')
@@ -228,6 +260,23 @@ def plot_terrain_and_path(coords, scores, path_indices, output_file=None):
         ax.set_zlim(z_mid - max_span/2, z_mid + max_span/2)
 
     ax.legend()
+
+    # Create an annotation box with parameters
+    info_text = (
+        f"Margin: {margin:.1f} m\n"
+        f"Score Threshold: {score_thresh:.2f}\n"
+        f"k (Neighbors): {k}\n"
+        f"β (Penalty): {beta:.2f}"
+    )
+
+    ax.text2D(
+        0.02, 0.98, info_text,
+        transform=ax.transAxes,
+        fontsize=10,
+        verticalalignment='top',
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="black", alpha=0.7)
+    )
+
     plt.tight_layout()
     if output_file:
         plt.savefig(output_file, dpi=300)
@@ -245,13 +294,13 @@ def main():
     parser.add_argument('end_x',      type=float, help='End easting (m)')
     parser.add_argument('end_y',      type=float, help='End northing (m)')
     parser.add_argument('--margin',    type=float, default=50.0,
-                        help='Bounding‐box margin around start/end (m)')
+                        help='Bounding-box margin around start/end (m)')
     parser.add_argument('--score_thresh', type=float, default=0.0,
                         help='Minimum trav_score to include (default 0.0)')
     parser.add_argument('--k',         type=int,   default=8,
                         help='Number of nearest neighbors per node (default 8)')
     parser.add_argument('--beta',      type=float, default=5.0,
-                        help='Penalty factor β for 1 − trav_score (default 5.0)')
+                        help='Penalty factor β for 1 - trav_score (default 5.0)')
     parser.add_argument('--output',    help='If set, save plot to this PNG')
     args = parser.parse_args()
 
@@ -290,6 +339,7 @@ def main():
     # Plot the terrain + path.
     plot_terrain_and_path(
         coords3d, scores, path_indices,
+        margin=args.margin, score_thresh=args.score_thresh, k=args.k, beta=args.beta,
         output_file=args.output
     )
 
