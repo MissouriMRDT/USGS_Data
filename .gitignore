@@ -20,6 +20,14 @@ utils/lidar_loader
 *.db-journal
 *.db-wal
 *.db-shm
+*.db
+
+# ──────────────
+# Database Files
+# ──────────────
+
+# Ignore SQLite database files due to their size
+*.db
 
 # ──────────────
 # Editor/Backup Files
@@ -28,3 +36,47 @@ utils/lidar_loader
 *~
 *.swp
 *.bak
+
+# ──────────────
+# Log Files
+# ──────────────
+
+*.csv
+*.log
+*.txt
+
+# ──────────────
+# Data Files
+# ──────────────
+
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# ──────────────
+# Python Artifacts and Virtual Environments
+# ──────────────
+
+# Ignore Python bytecode and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment directories
+venv/
+env/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore Python egg and distribution files
+*.egg
+*.egg-info/
+
+# Ignore pipenv files
+Pipfile.lock
+
+
