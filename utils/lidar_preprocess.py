@@ -467,7 +467,7 @@ def extract_utm_zone(las):
     
     # Attempt 1: Extract UTM zone from WKT string (most reliable).
     wkt_pattern = re.compile(r"UTM\s+zone\s+(\d+)([NS])", re.IGNORECASE)
-    
+
     for vlr in las.header.vlrs:
         if isinstance(vlr, laspy.vlrs.known.WktCoordinateSystemVlr):
             wkt_string = vlr.string
@@ -504,7 +504,7 @@ def extract_utm_zone(las):
     return -1, '?'
 
 
-def process_file(file_path, db_path):
+def process_file(file_path, db_path, manual_zone=None):
     """
     Load a LAS file and insert point data into a SQLite database.
 
@@ -520,6 +520,8 @@ def process_file(file_path, db_path):
         Path to the `.las` file to process.
     db_path : str
         Path to the target SQLite database.
+    manual_zone : str, optional
+        Manually specified UTM zone (e.g., '15N').
 
     Notes
     -----
@@ -537,8 +539,18 @@ def process_file(file_path, db_path):
 
     # Load LAS file and extract UTM zone
     las = laspy.read(file_path)
-    zone, hemi = extract_utm_zone(las)
-    zone_str = f"{zone}{hemi}" if zone > 0 else None
+    if manual_zone:
+        zone_str = manual_zone
+    else:
+        zone, hemi = extract_utm_zone(las)
+        zone_str = f"{zone}{hemi}" if zone > 0 else None
+
+    # Stop and print a warning if UTM zone is not found
+    if zone_str is None:
+        print(f"[ERROR] Could not determine UTM zone for file: {file_path}", file=sys.stderr)
+        print("        This LAS file does not contain UTM zone information in its VLRs.", file=sys.stderr)
+        print("        Please rerun this script with the new argument '--zone <zone>' to manually specify the UTM zone (e.g., '15N').", file=sys.stderr)
+        sys.exit(1)
 
     # Extract coordinate and classification data
     xs = las.x
@@ -930,6 +942,7 @@ def main():
     parser = argparse.ArgumentParser(description='Load LAS files into a spatial SQLite database with metrics')
     parser.add_argument('input', help='Input LAS file or directory')
     parser.add_argument('output', help='Output SQLite database file')
+    parser.add_argument('--zone', help='Manually specify UTM zone and hemisphere (e.g., 15N)', default=None)
     args = parser.parse_args()
 
     # Validate input arguments.
@@ -963,7 +976,12 @@ def main():
         print(f"  [{i}/{len(files)}] Processing: {f} ...")
         start = time.time()
         try:
-            process_file(f, args.output)
+            # Verify the zone is valid if specified
+            if args.zone and not re.match(r'^\d{1,2}[NS]$', args.zone):
+                print(f"Invalid UTM zone format: {args.zone}. Expected format is '15N' or '33S'.", file=sys.stderr)
+                sys.exit(1)
+
+            process_file(f, args.output, args.zone)
         except Exception as e:
             print(f"    Error processing {f}: {e}", file=sys.stderr)
             continue
@@ -977,7 +995,7 @@ def main():
     # Step 4: Compute terrain metrics in parallel
     print("[Step 4] - Computing terrain metrics (this may take a while)...")
     start = time.time()
-    compute_metrics(args.output, radius=3.0, workers=20)
+    compute_metrics(args.output, radius=3.0, workers=8)
     print(f"  Metrics computed in {time.time() - start:.2f} seconds.")
 
     # Step 5: Add triggers to auto-update R-tree when base table is modified
