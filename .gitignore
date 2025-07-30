@@ -2,9 +2,6 @@
 # Build Artifacts
 # ──────────────
 
-# Ignore compiled binaries in utils/
-utils/lidar_loader
-
 # Ignore general build/IDE artifacts
 *.o
 *.obj
@@ -20,14 +17,6 @@ utils/lidar_loader
 *.db-journal
 *.db-wal
 *.db-shm
-*.db
-
-# ──────────────
-# Database Files
-# ──────────────
-
-# Ignore SQLite database files due to their size
-*.db
 
 # ──────────────
 # Editor/Backup Files
