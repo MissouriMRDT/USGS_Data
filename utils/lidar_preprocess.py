@@ -942,6 +942,8 @@ def main():
     parser = argparse.ArgumentParser(description='Load LAS files into a spatial SQLite database with metrics')
     parser.add_argument('input', help='Input LAS file or directory')
     parser.add_argument('output', help='Output SQLite database file')
+    parser.add_argument('--workers', type=int, help='Number of parallel workers for metric computation', default=8)
+    parser.add_argument('--radius', type=float, help='Radius (m) for neighborhood searches during metric computation', default=5.0)
     parser.add_argument('--zone', help='Manually specify UTM zone and hemisphere (e.g., 15N)', default=None)
     args = parser.parse_args()
 
@@ -995,7 +997,7 @@ def main():
     # Step 4: Compute terrain metrics in parallel
     print("[Step 4] - Computing terrain metrics (this may take a while)...")
     start = time.time()
-    compute_metrics(args.output, radius=3.0, workers=8)
+    compute_metrics(args.output, radius=args.radius, workers=args.workers)
     print(f"  Metrics computed in {time.time() - start:.2f} seconds.")
 
     # Step 5: Add triggers to auto-update R-tree when base table is modified
