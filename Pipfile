@@ -10,6 +10,9 @@ open3d = "*"
 pyqt5 = "*"
 laspy = {extras = ["laszip"], version = "*"}
 laszip = "*"
+fastapi = "*"
+aiofiles = "*"
+uvicorn = {extras = ["standard"], version = "*"}
 
 [dev-packages]
 

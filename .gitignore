@@ -9,6 +9,8 @@
 *.out
 *.log
 
+configs/
+
 # ──────────────
 # Temporary SQLite Files
 # ──────────────
