@@ -4,30 +4,33 @@ lidar_rf_realtime.py
 
 LiDAR -> 3D viewer + RF propagation demo.
 
-Changes in this version:
-- Improved antenna pattern model using per-config azimuth/elevation measured patterns (if present).
-- Vertical pattern applied using elevation_pattern or vp_bw_deg.
-- TX/RX ground heights passed into pattern calculation for meaningful elevation angles.
-- configs/ directory with richer default AMY-9M16 JSON (derived from uploaded datasheet).
-- /reload_configs endpoint to hot-reload configs.
-- UI still dynamically renders antenna config editor and includes TX-level controls.
+Revisions included here:
+- Antenna pattern improvements and configs directory.
+- Streaming full-resolution pointcloud (NDJSON) via /pointcloud_full.
+- Server-side reservoir sampling for fast loading and KD-tree building.
+- Worker initializer receives points and grid arrays to avoid per-task pickling.
+- Simulation progress broadcasting: server sends {"type":"sim_progress","percent":N} over websockets.
+- Client HTML/JS updated to progressively stream the point cloud and avoid flashing by keeping
+  the previous display until the streamed replacement has reached a threshold.
 """
 import argparse
 import asyncio
 import json
 import math
 import os
+import random
 import sqlite3
 import time
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
 import uvicorn
 
 # KD-tree
@@ -45,9 +48,9 @@ def ensure_default_configs():
     """
     Ensure configs/ exists and contains at least one example config.
     Creates:
-      - AMY-9M16.json (900 MHz Yagi defaults, as before)
-      - AM-2G16-90.json (2.3-2.7 GHz sector / 2.4 GHz use)
-      - AM-5G20-90.json (5.15-5.85 GHz sector / 5 GHz use)
+      - AMY-9M16.json (900 MHz Yagi defaults)
+      - AM-2G16-90.json (2.3-2.7 GHz sector)
+      - AM-5G20-90.json (5.15-5.85 GHz sector)
     """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -389,14 +392,29 @@ def antenna_pattern_gain_db(tx: Dict, rx_x: float, rx_y: float) -> float:
     return float(total_gain_db)
 
 # ------------------------
-# DB / point cloud loader (no downsampling)
+# DB / point cloud loader (streaming + reservoir sampling for server-side)
 # ------------------------
-def load_pointcloud_from_db(db_path: str, bbox: Tuple[float,float,float,float]=None) -> Tuple[np.ndarray, List[Dict]]:
+def load_pointcloud_from_db(db_path: str,
+                           bbox: Optional[Tuple[float,float,float,float]] = None,
+                           max_points: Optional[int] = None,
+                           max_server_points: int = 1500000) -> Tuple[np.ndarray, List[Dict]]:
     """
-    Load every point matching the query from ProcessedLiDARPoints (no downsampling).
-    Returns Nx3 numpy array (easting, northing, altitude) and metadata list.
+    Stream rows from the DB and optionally reservoir-sample to max_points for client
+    or to max_server_points for server use.
+    - If max_points is provided, returns at most max_points rows (sampled).
+    - Otherwise caps server-side returned points to max_server_points.
+    Returns (points_array Nx3, metadata list) where points_array are the sampled points.
     """
     conn = sqlite3.connect(db_path)
+    conn.row_factory = None
+    # speed up pragmas for bulk read (safe for read-only usage)
+    try:
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.execute("PRAGMA mmap_size = 30000000000;")
+        conn.execute("PRAGMA journal_mode = OFF;")
+    except Exception:
+        pass
+
     c = conn.cursor()
     if bbox:
         min_x, min_y, max_x, max_y = bbox
@@ -410,19 +428,96 @@ def load_pointcloud_from_db(db_path: str, bbox: Tuple[float,float,float,float]=N
     else:
         q = "SELECT id, easting, northing, altitude, classification FROM ProcessedLiDARPoints"
         params = ()
-    c.execute(q, params)
-    rows = c.fetchall()
+
+    try:
+        c.execute(q, params)
+    except Exception as e:
+        conn.close()
+        raise
+
+    sample_limit = max_points if (max_points is not None) else max_server_points
+    sampled_pts = []
+    sampled_meta = []
+    total_seen = 0
+    fetch_size = 10000
+
+    while True:
+        rows = c.fetchmany(fetch_size)
+        if not rows:
+            break
+        for r in rows:
+            total_seen += 1
+            pid, x, y, z, cls = r
+            pt = (float(x), float(y), float(z))
+            meta = {"id": int(pid), "class": cls}
+            if len(sampled_pts) < sample_limit:
+                sampled_pts.append(pt)
+                sampled_meta.append(meta)
+            else:
+                j = random.randrange(total_seen)
+                if j < sample_limit:
+                    sampled_pts[j] = pt
+                    sampled_meta[j] = meta
+
     conn.close()
-    if not rows:
+
+    if not sampled_pts:
         return np.zeros((0,3)), []
-    pts = []
-    meta = []
-    for r in rows:
-        pid, x, y, z, cls = r
-        pts.append((float(x), float(y), float(z)))
-        meta.append({"id": int(pid), "class": cls})
-    pts = np.array(pts, dtype=float)
-    return pts, meta
+
+    pts = np.array(sampled_pts, dtype=float)
+    return pts, sampled_meta
+
+# ------------------------
+# Full-resolution stream endpoint generator (NDJSON)
+# ------------------------
+def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,float], fetch_size: int = 10000):
+    """
+    Yield newline-delimited JSON lines: one point per line: {"x": x, "y": y, "z": z}
+    Final line is metadata: {"_meta": {"centroid": [...], "bounds":[minx,maxx,miny,maxy,minz,maxz], "count": N}}
+    """
+    minx, miny, maxx, maxy = bbox
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    q = """
+        SELECT p.easting, p.northing, p.altitude
+        FROM ProcessedLiDARPoints_idx AS idx
+        JOIN ProcessedLiDARPoints AS p ON p.id = idx.id
+        WHERE idx.min_x BETWEEN ? AND ? AND idx.min_y BETWEEN ? AND ?
+    """
+    params = (minx, maxx, miny, maxy)
+    try:
+        c.execute(q, params)
+    except Exception as e:
+        conn.close()
+        # yield no rows: error will be handled by response
+        return
+
+    total = 0
+    sx = sy = sz = 0.0
+    xmin = ymin = zmin = float("inf")
+    xmax = ymax = zmax = float("-inf")
+
+    while True:
+        rows = c.fetchmany(fetch_size)
+        if not rows:
+            break
+        for r in rows:
+            x = float(r[0]); y = float(r[1]); z = float(r[2])
+            total += 1
+            sx += x; sy += y; sz += z
+            xmin = min(xmin, x); ymin = min(ymin, y); zmin = min(zmin, z)
+            xmax = max(xmax, x); ymax = max(ymax, y); zmax = max(zmax, z)
+            yield (json.dumps({"x": x, "y": y, "z": z}) + "\n").encode('utf-8')
+
+    if total > 0:
+        centroid = [sx / total, sy / total, sz / total]
+        bounds = [xmin, xmax, ymin, ymax, zmin, zmax]
+    else:
+        centroid = [0.0, 0.0, 0.0]
+        bounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    yield (json.dumps({"_meta": {"centroid": centroid, "bounds": bounds, "count": total}}) + "\n").encode('utf-8')
+    conn.close()
 
 # ------------------------
 # Occlusion test utilities (worker-side)
@@ -458,17 +553,32 @@ def estimate_obstruction_loss_local(tx: Tuple[float,float,float],
     return per_blocker_db * math.sqrt(blocker_count)
 
 # ------------------------
-# Worker globals & initializer
+# Worker globals & initializer (updated to also accept grid arrays)
 # ------------------------
 _WORKER_PTS = None
 _WORKER_KDTREE = None
+_WORKER_GRID_X = None
+_WORKER_GRID_Y = None
 
-def _worker_init(pts: np.ndarray):
+def _worker_init(pts: np.ndarray, grid_x=None, grid_y=None):
     """
     Worker initializer: each worker gets its own local copy reference and builds KD-tree.
+    grid_x, grid_y are optional lists/arrays of grid coordinates so workers can map
+    ix/iy -> world coordinates without receiving them per-task.
     """
-    global _WORKER_PTS, _WORKER_KDTREE
+    global _WORKER_PTS, _WORKER_KDTREE, _WORKER_GRID_X, _WORKER_GRID_Y
     _WORKER_PTS = pts
+    _WORKER_GRID_X = None
+    _WORKER_GRID_Y = None
+    if grid_x is not None:
+        # convert to Python list for safe pickling / memory sharing
+        try:
+            _WORKER_GRID_X = list(grid_x)
+            _WORKER_GRID_Y = list(grid_y)
+        except Exception:
+            # fallback: convert via numpy
+            _WORKER_GRID_X = list(np.array(grid_x).tolist())
+            _WORKER_GRID_Y = list(np.array(grid_y).tolist())
     if pts is None or pts.size == 0:
         _WORKER_KDTREE = None
     else:
@@ -479,23 +589,36 @@ def _worker_init(pts: np.ndarray):
             _WORKER_KDTREE = KDTree(xy.tolist())
 
 # ------------------------
-# Worker computation
+# Worker computation (adjusted to use worker-global grid arrays)
 # ------------------------
 def _compute_rssi_chunk(chunk_args):
-    (txs, grid_x, grid_y, nx, ny, idx_start, idx_end, default_freq_hz, tx_power_dbm, sample_step_m) = chunk_args
+    (txs, nx, ny, idx_start, idx_end, default_freq_hz, tx_power_dbm, sample_step_m) = chunk_args
     pts_local = _WORKER_PTS
     kdtree_local = _WORKER_KDTREE
+    grid_x_local = _WORKER_GRID_X
+    grid_y_local = _WORKER_GRID_Y
+
     if pts_local is None or pts_local.shape[0] == 0 or kdtree_local is None:
         return (idx_start, [-999.0] * (idx_end - idx_start))
+    if grid_x_local is None or grid_y_local is None:
+        return (idx_start, [-999.0] * (idx_end - idx_start))
+
     rssi_out = []
     for flat_idx in range(idx_start, idx_end):
         iy = flat_idx // nx
         ix = flat_idx % nx
-        gx = grid_x[ix]
-        gy = grid_y[iy]
+        # get world coords for this grid cell from worker-local lists
+        try:
+            gx = float(grid_x_local[ix])
+            gy = float(grid_y_local[iy])
+        except Exception:
+            # defensive fallback to zeros if indexing fails
+            gx = 0.0
+            gy = 0.0
+
         try:
             _, nn = kdtree_local.query([gx, gy], k=1)
-            z_ground = float(pts_local[nn][2])
+            z_ground = float(pts_local[int(nn)][2])
         except Exception:
             z_ground = float(np.median(pts_local[:,2]))
         best_rssi = -999.0
@@ -507,7 +630,7 @@ def _compute_rssi_chunk(chunk_args):
             freq_hz = float(tx.get("freq_hz", default_freq_hz))
             try:
                 _, tnn = kdtree_local.query([tx_x, tx_y], k=1)
-                ground_tx_z = float(pts_local[tnn][2])
+                ground_tx_z = float(pts_local[int(tnn)][2])
             except Exception:
                 ground_tx_z = float(np.median(pts_local[:,2]))
             tx_z = ground_tx_z + tx_h
@@ -519,7 +642,7 @@ def _compute_rssi_chunk(chunk_args):
             tx_for_pattern = dict(tx)
             tx_for_pattern['tx_ground_z'] = ground_tx_z
             tx_for_pattern['rx_ground_z'] = z_ground
-            tx_for_pattern['rx_abs_z'] = z_ground  # rx absolute ground; receiver assumed ground for grid points
+            tx_for_pattern['rx_abs_z'] = z_ground  # receiver assumed ground for grid points
 
             ant_gain = antenna_pattern_gain_db(tx_for_pattern, gx, gy)
             obs_loss = estimate_obstruction_loss_local((tx_x, tx_y, tx_z), (gx, gy, z_ground), kdtree_local, pts_local,
@@ -554,15 +677,45 @@ def compute_rssi_grid_parallel(txs: List[Dict],
     for i in range(0, total, chunk_size):
         start = i
         end = min(total, i + chunk_size)
-        tasks.append((txs, grid_x, grid_y, nx, ny, start, end, float(default_freq_hz), float(tx_power_dbm), float(sample_step_m)))
+        # reduced per-task args (grid arrays are provided in worker initializer)
+        tasks.append((txs, nx, ny, start, end, float(default_freq_hz), float(tx_power_dbm), float(sample_step_m)))
     futures = [executor.submit(_compute_rssi_chunk, t) for t in tasks]
     rssi_flat = [-999.0] * total
+
+    completed = 0
+    total_futs = len(futures)
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        loop = None
+
     for fut in as_completed(futures):
         try:
             idx_start, rlist = fut.result()
             rssi_flat[idx_start:idx_start + len(rlist)] = rlist
         except Exception as e:
             print("Worker failed:", e)
+        completed += 1
+        # compute percent
+        try:
+            percent = int((completed / float(total_futs)) * 100.0)
+        except Exception:
+            percent = 0
+        # schedule non-blocking broadcast of progress
+        try:
+            if loop and loop.is_running():
+                loop.create_task(broadcast_message(json.dumps({"type": "sim_progress", "percent": percent})))
+        except Exception:
+            pass
+
+    # final 100% broadcast
+    try:
+        if loop and loop.is_running():
+            loop.create_task(broadcast_message(json.dumps({"type": "sim_progress", "percent": 100})))
+    except Exception:
+        pass
+
     rss_grid = np.array(rssi_flat, dtype=float).reshape((ny, nx))
     return rss_grid
 
@@ -570,12 +723,15 @@ def compute_rssi_grid_parallel(txs: List[Dict],
 # FastAPI app + websockets (UI unchanged from prior)
 # ------------------------
 app = FastAPI()
+# GZip for large transfers
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
 connected_websockets: List[WebSocket] = []
 
 DB_PATH = None
 
-# HTML_PAGE omitted here for brevity in this comment block; use the same HTML implemented earlier
-# (it already supports antenna editor, TX-level fields, etc). We'll return it from the index route below.
+# Full HTML page (client)
+# Important: this HTML listens for sim_progress and streams /pointcloud_full progressively.
 HTML_PAGE = r"""
 <!doctype html>
 <html>
@@ -596,6 +752,8 @@ HTML_PAGE = r"""
     button { margin-top:6px; }
     .tx-group { margin-top:8px; padding:6px; border-radius:6px; background: #f3f3f3; color:#000; }
     .tx-group label { color: #000; }
+    #progressBarContainer { width:100%; background:#ddd; border-radius:6px; overflow:hidden; margin-top:6px; display:none; }
+    #progressBar { height:12px; width:0%; background:#4caf50; }
   </style>
 </head>
 <body>
@@ -607,7 +765,7 @@ HTML_PAGE = r"""
     <label>UTM Northing</label><input id="utm_n" type="number" step="0.01" value="0"/><br/>
     <label>Radius (m)</label><input id="utm_r" type="number" step="1" value="100"/><br/>
     <div style="margin-top:6px;">
-      <button id="loadArea">Load area</button>
+      <button id="loadArea">Load area (stream full res)</button>
       <button id="clearTx">Clear TX</button>
     </div>
   </div>
@@ -631,7 +789,7 @@ HTML_PAGE = r"""
       <option value="__loading__">Loading...</option>
     </select><br/>
     <div id="ant_config_editor" style="margin-top:8px;">
-      <!-- Dynamically generated config fields will appear here, exact keys from config JSON -->
+      <!-- Dynamically generated config fields will appear here -->
       <div class="config-note">Select an antenna config to edit its fields (the editor mirrors the config file).</div>
     </div>
 
@@ -658,6 +816,8 @@ HTML_PAGE = r"""
 
   <div><b>Clients:</b> <span id="clients">0</span></div>
   <div><b>Loaded points:</b> <span id="ptcount">0</span></div>
+
+  <div id="progressBarContainer"><div id="progressBar"></div></div>
 
   <div id="legend">
     <div class="color-bar"></div>
@@ -743,7 +903,6 @@ function renderAntConfigEditor(spec){
     container.innerHTML = '<div class="config-note">No antenna config available. You may add JSON files to the server configs/ directory and restart the server.</div>';
     return;
   }
-  // Render each key in sorted order for stable layout
   const keys = Object.keys(spec).filter(k => k !== '__filename').sort();
   for(const k of keys){
     const val = spec[k];
@@ -754,7 +913,6 @@ function renderAntConfigEditor(spec){
     lbl.setAttribute('for', `cfg_${k}`);
     row.appendChild(lbl);
 
-    // Choose input type by value type
     let input;
     if(typeof val === 'boolean'){
       input = document.createElement('input');
@@ -762,7 +920,6 @@ function renderAntConfigEditor(spec){
       input.id = `cfg_${k}`;
       input.checked = !!val;
       input.dataset.type = 'boolean';
-      // make core identity fields read-only
       if(k === 'name' || k === 'model' || k === 'type') input.disabled = true;
       const wrap = document.createElement('div');
       wrap.style.display = 'flex';
@@ -773,7 +930,6 @@ function renderAntConfigEditor(spec){
       input = document.createElement('input');
       input.type = 'number';
       input.id = `cfg_${k}`;
-      // choose step based on magnitude
       const step = Math.abs(val) >= 1000 ? '1' : (Math.abs(val) >= 1 ? '0.1' : '0.001');
       input.step = step;
       input.value = val;
@@ -781,7 +937,6 @@ function renderAntConfigEditor(spec){
       if(k === 'name' || k === 'model' || k === 'type') input.disabled = true;
       row.appendChild(input);
     } else {
-      // treat as string
       input = document.createElement('input');
       input.type = 'text';
       input.id = `cfg_${k}`;
@@ -887,6 +1042,7 @@ async function init(){
     bounds = [0,0,0,0,0,0];
     document.getElementById('ptcount').innerText = '0';
 
+    // heat points for simulation output
     heatPoints = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({size: 2, vertexColors:true}));
     scene.add(heatPoints);
 
@@ -908,7 +1064,11 @@ async function init(){
 
     ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
     ws.onopen = ()=>console.log('WS open');
-    ws.onmessage = (evt)=>{ try{ const m = JSON.parse(evt.data); if(m.type === 'clients') document.getElementById('clients').innerText = m.count; if(m.type === 'heatmap') renderHeatmap(m.grid); }catch(e){ showError('WS parse error: ' + e.message); } };
+    ws.onmessage = (evt)=>{ try{ const m = JSON.parse(evt.data);
+        if(m.type === 'clients') document.getElementById('clients').innerText = m.count;
+        else if(m.type === 'heatmap') renderHeatmap(m.grid);
+        else if(m.type === 'sim_progress') updateSimProgress(m.percent);
+    }catch(e){ showError('WS parse error: ' + e.message); } };
     ws.onclose = ()=>console.log('WS closed');
     ws.onerror = (e)=> showError('WS error');
 
@@ -921,6 +1081,7 @@ async function init(){
       const r = parseFloat(document.getElementById('utm_r').value || '100');
       try{
         document.getElementById('ptcount').innerText = 'loading...';
+        // Call load_bbox to prepare server KD-tree and return client sample metadata + cached sample points
         const res = await fetch('/load_bbox', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
@@ -928,9 +1089,16 @@ async function init(){
         });
         if(!res.ok) throw new Error(`HTTP ${res.status}`);
         const info = await res.json();
-        const pc = await safeGet('/pointcloud');
-        await updatePointCloudFromJSON(pc);
-        document.getElementById('ptcount').innerText = info.count;
+        // Start streaming the full-resolution NDJSON
+        streamFullPointcloud();
+        // if server returned a quick client sample, render it immediately to give instant feedback
+        if(info.client_points && Array.isArray(info.client_points) && info.client_points.length > 0){
+          await updatePointCloudFromJSON({"points": info.client_points, "centroid": info.centroid, "bounds": info.bounds});
+          document.getElementById('ptcount').innerText = info.client_sample_count || info.count || 'loaded';
+        } else {
+          // leave existing points visible until streaming fills replacement
+          document.getElementById('ptcount').innerText = info.count || 'loading';
+        }
       }catch(err){
         showError('Load area failed: ' + (err && err.message ? err.message : String(err)));
       }
@@ -964,7 +1132,6 @@ async function init(){
       const worldX = intersect.x + (centroid[0] || 0);
       const worldY = intersect.y + (centroid[1] || 0);
 
-      // Read TX-level fields (restored)
       const h = parseFloat(document.getElementById('txh') ? document.getElementById('txh').value : '2') || 2;
       const p = parseFloat(document.getElementById('txp') ? document.getElementById('txp').value : '20') || 20;
       const freqEl = document.getElementById('freq');
@@ -973,11 +1140,9 @@ async function init(){
 
       const sel = document.getElementById('ant_config');
       const ant_config = sel ? sel.value : null;
-      // gather edited fields from editor and merge with selected spec
       let antenna_spec = null;
       if(ant_config && antennaSpecsCache[ant_config]){
         antenna_spec = Object.assign({}, antennaSpecsCache[ant_config]);
-        // collect overrides
         const container = document.getElementById('ant_config_editor');
         const inputs = container.querySelectorAll('[id^="cfg_"]');
         inputs.forEach(inp=>{
@@ -1032,6 +1197,9 @@ async function init(){
     document.getElementById('simulate').onclick = async ()=>{
       try{
         document.getElementById('simulate').disabled = true;
+        // show progress UI
+        document.getElementById('progressBarContainer').style.display = 'block';
+        document.getElementById('progressBar').style.width = '0%';
         const res = await fetch('/simulate', {method:'POST'});
         if(!res.ok){
           const txt = await res.text();
@@ -1042,9 +1210,12 @@ async function init(){
         const payload = await res.json();
         if(payload && payload.grid) renderHeatmap(payload.grid);
         document.getElementById('simulate').disabled = false;
+        // hide progress shortly after completion
+        setTimeout(()=>{ document.getElementById('progressBarContainer').style.display = 'none'; }, 1200);
       }catch(err){
         showError('Simulate failed: ' + (err && err.message ? err.message : String(err)));
         document.getElementById('simulate').disabled = false;
+        document.getElementById('progressBarContainer').style.display = 'none';
       }
     };
 
@@ -1053,6 +1224,7 @@ async function init(){
   }
 }
 
+// Update or create point cloud from a JSON payload like /pointcloud (sampled)
 async function updatePointCloudFromJSON(json){
   try{
     if(!json || !Array.isArray(json.points)) throw new Error('Invalid /pointcloud response');
@@ -1082,6 +1254,205 @@ async function updatePointCloudFromJSON(json){
     document.getElementById('ptcount').innerText = pointCloud.length;
   }catch(e){
     showError('updatePointCloudFromJSON error: ' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+// STREAM full-resolution NDJSON and update display progressively (no flash).
+async function streamFullPointcloud(){
+  try{
+    const resp = await fetch('/pointcloud_full');
+    if(!resp.ok){
+      const txt = await resp.text();
+      showError('/pointcloud_full failed: ' + txt);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let { value: chunk, done: readerDone } = await reader.read();
+    let buffer = '';
+    // We'll accumulate new points in arrays, and only replace the visible cloud once we have enough
+    const newPositions = [];
+    const newMeta = { count: 0, centroid: [0,0,0], bounds: [0,0,0,0,0,0] };
+    // create a temporary Points object but don't add it to the scene until it's sizeable
+    let tempPoints = null;
+    let tempMaterial = null;
+    // threshold: wait until we have at least 2000 points before swapping to avoid flashing
+    const SWAP_THRESHOLD = 2000;
+    const FLUSH_CHUNK = 1000; // how many points to buffer between geometry updates
+    let flushCounter = 0;
+    // streaming loop
+    while(!readerDone){
+      if(chunk){
+        buffer += decoder.decode(chunk, {stream: true});
+        let nl;
+        while((nl = buffer.indexOf('\n')) >= 0){
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl+1);
+          if(line.length === 0) continue;
+          let obj = null;
+          try{
+            obj = JSON.parse(line);
+          }catch(e){
+            console.warn('json parse line', e, line);
+            continue;
+          }
+          if(obj._meta){
+            // final metadata (centroid/bounds/count)
+            newMeta.count = obj._meta.count || newPositions.length;
+            newMeta.centroid = obj._meta.centroid || newMeta.centroid;
+            newMeta.bounds = obj._meta.bounds || newMeta.bounds;
+            // finished streaming - perform final swap if tempPoints exists
+            if(tempPoints && newPositions.length > 0){
+              // finalize geometry
+              const positions = new Float32Array(newPositions.length * 3);
+              for(let i=0;i<newPositions.length;i++){
+                positions[i*3+0] = newPositions[i][0] - newMeta.centroid[0];
+                positions[i*3+1] = newPositions[i][1] - newMeta.centroid[1];
+                positions[i*3+2] = newPositions[i][2] - newMeta.centroid[2];
+              }
+              const geom = new THREE.BufferGeometry();
+              geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+              // keep same size calculation as updatePointCloudFromJSON
+              const spanX = newMeta.bounds[1] - newMeta.bounds[0];
+              const spanY = newMeta.bounds[3] - newMeta.bounds[2];
+              const spanZ = newMeta.bounds[5] - newMeta.bounds[4];
+              const span = Math.max(1, spanX, spanY, spanZ);
+              const size = Math.max(0.6, span / 2000);
+              const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
+              const newPc = new THREE.Points(geom, mat);
+              // Add newPc and remove old pcPoints if present
+              scene.add(newPc);
+              if(pcPoints){
+                scene.remove(pcPoints);
+                if(pcPoints.geometry) pcPoints.geometry.dispose();
+              }
+              pcPoints = newPc;
+              centroid = newMeta.centroid;
+              bounds = newMeta.bounds;
+              document.getElementById('ptcount').innerText = newPositions.length;
+            }
+            // done
+            return;
+          } else {
+            // regular point object
+            if(typeof obj.x === 'number' && typeof obj.y === 'number' && typeof obj.z === 'number'){
+              newPositions.push([obj.x, obj.y, obj.z]);
+              flushCounter++;
+            }
+            // If this is the first time we've accumulated enough points, create the tempPoints object
+            if(tempPoints === null && newPositions.length >= Math.min(SWAP_THRESHOLD, FLUSH_CHUNK)){
+              // prepare partial geometry (we'll update it periodically)
+              const initialCount = Math.min(newPositions.length, newPositions.length);
+              const positions = new Float32Array(initialCount * 3);
+              for(let i=0;i<initialCount;i++){
+                positions[i*3+0] = newPositions[i][0];
+                positions[i*3+1] = newPositions[i][1];
+                positions[i*3+2] = newPositions[i][2];
+              }
+              const geom = new THREE.BufferGeometry();
+              geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+              tempMaterial = new THREE.PointsMaterial({size: 0.6, sizeAttenuation:true, color:0xcccccc});
+              tempPoints = new THREE.Points(geom, tempMaterial);
+              // Do not remove old pcPoints yet — keep both visible to avoid flashing.
+              scene.add(tempPoints);
+              // center adjustment will be applied on finalization; for now display relative positions anchored to previous centroid (may be slightly off)
+            }
+            // periodically flush incremental updates to tempPoints to give visual feedback
+            if(tempPoints && flushCounter >= FLUSH_CHUNK){
+              // expand tempPoints geometry to include newPoints
+              const curLen = tempPoints.geometry.getAttribute('position').array.length / 3;
+              const addLen = Math.max(0, newPositions.length - curLen);
+              if(addLen > 0){
+                const newArr = new Float32Array((curLen + addLen) * 3);
+                newArr.set(tempPoints.geometry.getAttribute('position').array, 0);
+                // write added points
+                for(let i=0;i<addLen;i++){
+                  const p = newPositions[curLen + i];
+                  newArr[(curLen + i)*3 + 0] = p[0];
+                  newArr[(curLen + i)*3 + 1] = p[1];
+                  newArr[(curLen + i)*3 + 2] = p[2];
+                }
+                tempPoints.geometry.setAttribute('position', new THREE.BufferAttribute(newArr, 3));
+                tempPoints.geometry.attributes.position.needsUpdate = true;
+              }
+              flushCounter = 0;
+              // if we've reached the SWAP_THRESHOLD, finalize swap
+              if(newPositions.length >= SWAP_THRESHOLD){
+                // Build final geometry and swap
+                const positions = new Float32Array(newPositions.length * 3);
+                // center to centroid when meta is available; if not yet available, center to first-pass centroid
+                let cx = centroid[0] || 0;
+                let cy = centroid[1] || 0;
+                let cz = centroid[2] || 0;
+                for(let i=0;i<newPositions.length;i++){
+                  positions[i*3+0] = newPositions[i][0] - cx;
+                  positions[i*3+1] = newPositions[i][1] - cy;
+                  positions[i*3+2] = newPositions[i][2] - cz;
+                }
+                const geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                const span = 1;
+                const size = Math.max(0.6, span / 2000);
+                const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
+                const newPc = new THREE.Points(geom, mat);
+                scene.add(newPc);
+                // remove old pcPoints
+                if(pcPoints){
+                  scene.remove(pcPoints);
+                  if(pcPoints.geometry) pcPoints.geometry.dispose();
+                }
+                // remove tempPoints
+                if(tempPoints){
+                  scene.remove(tempPoints);
+                  if(tempPoints.geometry) tempPoints.geometry.dispose();
+                  tempPoints = null;
+                  tempMaterial = null;
+                }
+                pcPoints = newPc;
+                // update displayed count
+                document.getElementById('ptcount').innerText = newPositions.length;
+              }
+            }
+          }
+        }
+      }
+      ({ value: chunk, done: readerDone } = await reader.read());
+    }
+
+    // If we exit loop without meta, finalize best-effort
+    if(newPositions.length > 0){
+      const positions = new Float32Array(newPositions.length * 3);
+      for(let i=0;i<newPositions.length;i++){
+        positions[i*3+0] = newPositions[i][0] - (centroid[0] || 0);
+        positions[i*3+1] = newPositions[i][1] - (centroid[1] || 0);
+        positions[i*3+2] = newPositions[i][2] - (centroid[2] || 0);
+      }
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({size:0.6, sizeAttenuation:true, color:0xffffff});
+      const newPc = new THREE.Points(geom, mat);
+      scene.add(newPc);
+      if(pcPoints){
+        scene.remove(pcPoints);
+        if(pcPoints.geometry) pcPoints.geometry.dispose();
+      }
+      pcPoints = newPc;
+      document.getElementById('ptcount').innerText = newPositions.length;
+    }
+
+  }catch(e){
+    showError('streamFullPointcloud failed: ' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+function updateSimProgress(percent){
+  const pct = Math.max(0, Math.min(100, percent||0));
+  const bar = document.getElementById('progressBar');
+  const container = document.getElementById('progressBarContainer');
+  container.style.display = 'block';
+  bar.style.width = pct + '%';
+  if(pct >= 100){
+    setTimeout(()=>{ container.style.display = 'none'; bar.style.width = '0%'; }, 800);
   }
 }
 
@@ -1121,7 +1492,7 @@ init();
 </script>
 </body>
 </html>
-"""  # keep the real HTML string you used previously (unchanged)
+"""  # end HTML_PAGE
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -1131,6 +1502,7 @@ async def index():
 async def pointcloud():
     """
     Return current server_state point subset (centered for viewer) along with metadata.
+    This is a sampled client-friendly payload (fast). For full resolution stream, use /pointcloud_full.
     """
     global server_state
     pts = server_state["pts"]
@@ -1139,8 +1511,29 @@ async def pointcloud():
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     cx = float(xs.mean()); cy = float(ys.mean()); cz = float(zs.mean())
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    centered = [{"x": float(x - cx), "y": float(y - cy), "z": float(z - cz)} for (x, y, z) in pts]
+    # by default send at most 120k points as sample
+    max_client = 120000
+    if pts.shape[0] > max_client:
+        idxs = np.linspace(0, pts.shape[0]-1, max_client, dtype=int)
+        sample = pts[idxs]
+    else:
+        sample = pts
+    centered = [{"x": float(x - cx), "y": float(y - cy), "z": float(z - cz)} for (x, y, z) in sample]
     return JSONResponse({"points": centered, "centroid": [cx, cy, cz], "bounds": bounds})
+
+@app.get("/pointcloud_full")
+async def pointcloud_full():
+    """
+    Stream the full-resolution point cloud for the last loaded bbox as NDJSON.
+    Each line: {"x":..., "y":..., "z":...}
+    Final line: {"_meta": {"centroid": [...], "bounds":[minx,maxx,miny,maxy,minz,maxz], "count": N}}
+    """
+    global server_state, DB_PATH
+    bbox = server_state.get("last_bbox")
+    if not bbox:
+        return JSONResponse({"error": "no bbox loaded - call /load_bbox first"}, status_code=400)
+    gen = stream_full_points_generator(DB_PATH, bbox)
+    return StreamingResponse(gen, media_type="application/x-ndjson")
 
 # --- endpoints for antenna configs and reload ---
 @app.get("/antenna_configs")
@@ -1183,6 +1576,7 @@ async def reload_configs():
     global server_state
     try:
         server_state["antenna_configs"] = load_antenna_configs()
+        server_state["client_sample"] = None
         return JSONResponse({"ok": True, "count": len(server_state["antenna_configs"])})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -1192,6 +1586,7 @@ async def load_bbox(req: Request):
     """
     Load subset of DB: JSON {cx, cy, r}
     Rebuilds executor and KD-trees for workers.
+    Also stores last_bbox in server_state for the /pointcloud_full stream.
     """
     global DB_PATH, server_state
     data = await req.json()
@@ -1204,7 +1599,11 @@ async def load_bbox(req: Request):
     minx = cx - r; maxx = cx + r
     miny = cy - r; maxy = cy + r
     print(f"[LOAD] loading bbox centered {cx},{cy} r={r} -> {minx},{miny} - {maxx},{maxy}")
-    pts, meta = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy))
+    server_state["last_bbox"] = (minx, miny, maxx, maxy)
+
+    # Sampled load for server-side KD-tree build (fast)
+    pts, meta = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy),
+                                       max_points=None, max_server_points=1500000)
     if pts.shape[0] == 0:
         return JSONResponse({"count": 0, "message": "no points in area"}, status_code=200)
     xy = pts[:, :2]
@@ -1216,11 +1615,11 @@ async def load_bbox(req: Request):
     server_state["kdtree"] = kdtree
     server_state["grid_x"] = None
     server_state["grid_y"] = None
+    server_state["client_sample"] = None
     cnt = pts.shape[0]
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     centroid = [float(xs.mean()), float(ys.mean()), float(zs.mean())]
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    print(f"[LOAD] loaded {cnt} points; centroid={centroid}")
     old_exec = server_state.get("executor")
     if old_exec:
         try:
@@ -1231,8 +1630,17 @@ async def load_bbox(req: Request):
     executor = ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init, initargs=(pts,))
     server_state["executor"] = executor
     server_state["num_workers"] = num_workers
-    print(f"[LOAD] Created executor with {num_workers} workers (workers will each build a local KD-tree).")
-    return JSONResponse({"count": cnt, "centroid": centroid, "bounds": bounds})
+    print(f"[LOAD] loaded {cnt} points; centroid={centroid}. Created executor with {num_workers} workers.")
+    # prepare a small client-friendly sample
+    client_pts, _ = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy), max_points=120000)
+    if client_pts.shape[0] > 0:
+        cx_c = float(client_pts[:,0].mean()); cy_c = float(client_pts[:,1].mean()); cz_c = float(client_pts[:,2].mean())
+        centered_client = [{"x": float(x - cx_c), "y": float(y - cy_c), "z": float(z - cz_c)} for (x,y,z) in client_pts]
+    else:
+        centered_client = []
+    server_state["client_sample"] = {"points": centered_client, "centroid": centroid, "bounds": bounds}
+    print(f"[LOAD] returning client sample {len(centered_client)} pts (client cap 120k)")
+    return JSONResponse({"count": cnt, "centroid": centroid, "bounds": bounds, "client_sample_count": len(centered_client), "client_points": centered_client})
 
 @app.post("/set_grid")
 async def set_grid(req: Request):
@@ -1247,6 +1655,7 @@ async def set_grid(req: Request):
     server_state["grid_margin"] = gm
     server_state["grid_x"] = None
     server_state["grid_y"] = None
+    server_state["client_sample"] = None
     print(f"[GRID] updated grid_res={gr} grid_margin={gm}")
     return JSONResponse({"grid_res": gr, "grid_margin": gm})
 
@@ -1305,6 +1714,7 @@ async def add_tx(req: Request):
 @app.post("/clear_txs")
 async def clear_txs():
     server_state["txs"].clear()
+    server_state["client_sample"] = None
     print("[TX] cleared")
     return JSONResponse({"ok": True})
 
@@ -1329,20 +1739,37 @@ async def simulate():
         server_state["grid_y"] = np.linspace(miny, maxy, ny)
     grid_x = server_state["grid_x"]
     grid_y = server_state["grid_y"]
-    executor = server_state.get("executor")
-    if executor is None:
-        num_workers = server_state.get("num_workers", os.cpu_count() or 4)
-        executor = ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init, initargs=(pts,))
-        print("[SIM] Created temporary executor for simulation.")
+
+    # Always create a fresh executor for the simulation pass that initializes workers with the grid arrays.
+    num_workers = server_state.get("num_workers", os.cpu_count() or 4)
     start = time.time()
-    rss = compute_rssi_grid_parallel(txs, grid_x, grid_y, server_state.get("freq_hz", 2.4e9),
-                                     executor=executor, num_workers=server_state.get("num_workers", os.cpu_count() or 4),
-                                     tx_power_dbm=20.0, sample_step_m=3.0)
+    rss = None
+    try:
+        # Convert grid to plain Python lists for stable pickling into initializer
+        grid_x_list = list(map(float, grid_x))
+        grid_y_list = list(map(float, grid_y))
+
+        with ProcessPoolExecutor(max_workers=num_workers,
+                                 initializer=_worker_init,
+                                 initargs=(pts, grid_x_list, grid_y_list)) as executor:
+            rss = compute_rssi_grid_parallel(txs, grid_x, grid_y, server_state.get("freq_hz", 2.4e9),
+                                             executor=executor, num_workers=num_workers,
+                                             tx_power_dbm=20.0, sample_step_m=3.0)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("[SIM] simulation exception:", tb)
+        return JSONResponse({"error": "simulation failed", "detail": str(e)}, status_code=500)
+
     elapsed = time.time() - start
     print(f"[SIM] compute finished in {elapsed:.2f}s")
+    if rss is None:
+        return JSONResponse({"error": "simulation produced no result"}, status_code=500)
     rssi_flat = [float(x) for x in rss.ravel().tolist()]
     payload = {"type":"heatmap", "grid": {"xs": [float(x) for x in grid_x], "ys": [float(y) for y in grid_y], "rssi": rssi_flat}}
-    await broadcast_message(json.dumps(payload))
+    try:
+        await broadcast_message(json.dumps(payload))
+    except Exception as e:
+        print("[SIM] broadcast error:", e)
     return JSONResponse(payload)
 
 @app.websocket("/ws")
@@ -1389,7 +1816,9 @@ server_state = {
     "freq_hz": 2.4e9,
     "executor": None,
     "num_workers": (os.cpu_count() or 4),
-    "antenna_configs": {}   # filled at startup
+    "antenna_configs": {},   # filled at startup
+    "client_sample": None,
+    "last_bbox": None
 }
 
 # ------------------------
@@ -1411,6 +1840,8 @@ def main():
     server_state["grid_y"] = None
     server_state["txs"] = []
     server_state["executor"] = None
+    server_state["client_sample"] = None
+    server_state["last_bbox"] = None
 
     # Load antenna configs at startup
     try:
@@ -1419,7 +1850,7 @@ def main():
         print("[CONFIG] failed to load antenna configs:", e)
         server_state["antenna_configs"] = {}
 
-    print("Server starting WITHOUT loading points. Use the web UI 'Load area' to populate a subset.")
+    print("Server starting WITHOUT loading points. Use the web UI 'Load area' to populate a subset (then stream full resolution).")
     print(f"Starting server at http://{args.host}:{args.port} ...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
