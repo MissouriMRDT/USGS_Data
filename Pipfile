@@ -12,7 +12,18 @@ laspy = {extras = ["laszip"], version = "*"}
 laszip = "*"
 fastapi = "*"
 aiofiles = "*"
+sionna = "*"
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
+trimesh = "*"
+pyembree = "*"
+pymeshlab = "*"
+pyrender = "*"
+httpx = "*"
 uvicorn = {extras = ["standard"], version = "*"}
+embreex = "*"
+cupy-cuda12x = "*"
 
 [dev-packages]
 

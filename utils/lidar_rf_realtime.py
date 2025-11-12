@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""
-lidar_rf_realtime.py
 
-LiDAR -> 3D viewer + RF propagation demo.
+# ******************************************************************************
+#  @file      lidar_rf_realtime.py
+#  @brief     Interactive LiDAR Point Cloud Explorer with Real-Time RF Simulation.
+# 
+#  This script implements a FastAPI web application that allows users to
+#  explore LiDAR point cloud data stored in a SQLite database and perform
+#  real-time RF coverage simulations using advanced GPU acceleration techniques.
+#
+# 
+#  @author     ClayJay3 (claytonraycowen@gmail.com)
+#  @date       2025-05-31
+#  @copyright  Copyright Mars Rover Design Team 2025 – All Rights Reserved
+# ******************************************************************************
 
-Revisions included here:
-- Antenna pattern improvements and configs directory.
-- Streaming full-resolution pointcloud (NDJSON) via /pointcloud_full.
-- Server-side reservoir sampling for fast loading and KD-tree building.
-- Worker initializer receives points and grid arrays to avoid per-task pickling.
-- Simulation progress broadcasting: server sends {"type":"sim_progress","percent":N} over websockets.
-- Client HTML/JS updated to progressively stream the point cloud and avoid flashing by keeping
-  the previous display until the streamed replacement has reached a threshold.
-"""
 import argparse
 import asyncio
 import json
@@ -33,24 +34,33 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 import uvicorn
 
-# KD-tree
+# Try to import advanced RF and GPU libraries.
+try:
+    import cupy as cp
+    HAS_CUPY = True
+    print("[GPU] CuPy available for GPU acceleration")
+except ImportError:
+    cp = np
+    HAS_CUPY = False
+    print("[GPU] CuPy not available, using NumPy")
+
+# KD-tree fallback.
 try:
     from scipy.spatial import cKDTree as KDTree
 except Exception:
-    from scipy.spatial import KDTree  # fallback
+    from scipy.spatial import KDTree
+
+# Speed of light constant.
+C = 299792458.0
 
 # ------------------------
-# Antenna config loader + default (uses datasheet info)
+# Antenna config loader + default
 # ------------------------
 CONFIG_DIR = Path("./configs")
 
 def ensure_default_configs():
     """
     Ensure configs/ exists and contains at least one example config.
-    Creates:
-      - AMY-9M16.json (900 MHz Yagi defaults)
-      - AM-2G16-90.json (2.3-2.7 GHz sector)
-      - AM-5G20-90.json (5.15-5.85 GHz sector)
     """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -153,7 +163,7 @@ def ensure_default_configs():
             json.dump(sector, f, indent=2)
         print(f"[CONFIG] Created sector antenna config at {sector_path}")
 
-    # AM-5G20-90 (5 GHz sector)
+    # --- AM-5G20-90 (5 GHz sector) ---
     sector5g_path = CONFIG_DIR / "AM-5G20-90.json"
     if not sector5g_path.exists():
         sector5g = {
@@ -206,8 +216,12 @@ def ensure_default_configs():
 
 def load_antenna_configs() -> Dict[str, Dict]:
     """
-    Load all .json files from configs/ into a dict keyed by config name.
-    Returns mapping name -> spec dict.
+    Load antenna configurations from JSON files in the configs/ directory.
+
+    Returns:
+    --------
+    Dict[str, Dict]
+        A dictionary mapping antenna names to their configuration dictionaries.
     """
     ensure_default_configs()
     specs = {}
@@ -224,190 +238,734 @@ def load_antenna_configs() -> Dict[str, Dict]:
     return specs
 
 # ------------------------
-# RF helpers
+# Advanced RF Models with GPU Acceleration
 # ------------------------
-C = 299792458.0  # speed of light m/s
-
-def fspl_db(dist_m: float, freq_hz: float) -> float:
-    """Free-space path loss in dB (distance in meters, freq in Hz)."""
-    if dist_m <= 0.001:
-        return 0.0
-    return 20.0 * math.log10(4.0 * math.pi * dist_m * freq_hz / C)
-
-def _angle_diff_deg(a: float, b: float) -> float:
-    """Smallest difference between two angles in degrees (0..180)."""
-    d = abs((a - b + 180.0) % 360.0 - 180.0)
-    return d
-
-def antenna_pattern_gain_db(tx: Dict, rx_x: float, rx_y: float) -> float:
+class GPURFSimulator:
     """
-    Improved antenna pattern:
-      - If antenna_spec contains 'azimuth_pattern' (list of [angle_deg, gain_db]),
-        use it (interpolated with wrap-around).
-      - Else use a Gaussian HPBW model (-3 dB at diff = HPBW/2).
-      - Apply vertical taper using 'elevation_pattern' or 'vp_bw_deg'.
-      - Respect fwd_back_db, sidelobe_db, and hard_null.
-    tx may include 'tx_ground_z' and 'rx_ground_z' to make elevation computation accurate.
+    GPU-accelerated RF coverage simulator using point cloud data.
+    Uses CuPy for GPU computations if available, otherwise falls back to NumPy.
+    Implements Fresnel reflections, diffraction, and occlusion using trimesh ray tracing.
     """
-    spec = tx.get("antenna_spec") if "antenna_spec" in tx else None
 
-    def angdiff(a, b):
-        return abs((a - b + 180.0) % 360.0 - 180.0)
+    def __init__(self):
+        """
+        Initialize the GPURFSimulator.
+        """
+        self.initialized = False
+        self.mesh = None
+        self.original_points = None
+        self.mesh_shift = np.zeros(3, dtype=float)
 
-    # compute bearing (0=east, 90=north), convert user heading (0=north) -> east-zero
-    dx = float(rx_x) - float(tx["x"])
-    dy = float(rx_y) - float(tx["y"])
-    bearing = (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
-    heading_user = float(tx.get("heading_deg", 0.0)) % 360.0
-    heading_east0 = (heading_user + 90.0) % 360.0
-    az_diff = angdiff(bearing, heading_east0)
-    az_abs = bearing  # absolute azimuth to interpolate measured azimuth patterns
+    def initialize(self, points: np.ndarray):
+        """
+        Initialize the GPU RF simulator with the given point cloud.
 
-    # fallback legacy if no spec provided
-    if not spec:
-        ttype = str(tx.get("ant_type", "omni")).lower()
-        peak_db = float(tx.get("antenna_gain_db", 0.0))
-        if ttype == "omni":
-            return peak_db
-        beam = float(tx.get("beamwidth_deg", 90.0))
-        half = max(1e-3, beam / 2.0)
-        sidelobe_db = float(tx.get("sidelobe_db", -80.0))
-        alpha = float(tx.get("pattern_sharpness", 2.5))
-        if az_diff > half:
-            if tx.get("hard_null", False):
-                return peak_db - 120.0
-            return peak_db + sidelobe_db
-        theta = math.pi * az_diff / (2.0 * half)
-        rel = math.cos(theta)
-        rel = max(0.0, rel) ** alpha
-        rel_linear = max(rel, 1e-12)
-        rel_db = 10.0 * math.log10(rel_linear)
-        return peak_db + rel_db
+        Parameters:
+        -----------
+        points : np.ndarray
+            The input point cloud as an (N,3) array of XYZ coordinates.
 
-    # -----------------------
-    # AZIMUTH (horizontal) GAIN
-    # -----------------------
-    peak_db = float(spec.get("gain_db", tx.get("antenna_gain_db", 0.0)))
-    sidelobe_db = float(spec.get("sidelobe_db", -80.0))
-    fwd_back_db = float(spec.get("fwd_back_db", spec.get("fbr_db", 20.0)))
-    hard_null = bool(spec.get("hard_null", False))
+        Returns:
+        --------
+        None
+        """
+        if points is None or points.size == 0:
+            print("[GPU] initialize called with empty points")
+            return
 
-    az_gain_db = None
-    azpat = spec.get("azimuth_pattern")
-    if azpat:
-        # Accept either dict {"angles":[..],"gains":[..]} or list[[angle,gain], ...]
-        if isinstance(azpat, dict) and "angles" in azpat and "gains" in azpat:
-            angles = np.array(azpat["angles"], dtype=float) % 360.0
-            gains = np.array(azpat["gains"], dtype=float)
+        print("[GPU] Initializing GPU-accelerated RF simulation (keeping original coordinates)...")
+        # Keep original points. (in same coordinate system as KD-tree and TX coords)
+        self.original_points = np.asarray(points, dtype=float)
+        
+        self.initialized = True
+        print("[GPU] GPU simulation initialized")
+
+    def compute_coverage_gpu(self, txs: List[Dict], grid_x: np.ndarray,
+                         grid_y: np.ndarray, freq_hz: float,
+                         kdtree: any, point_cloud: np.ndarray,
+                         coarse_plane_grid_m: float = 10.0) -> np.ndarray:
+        """
+        Compute RF coverage over a grid using GPU acceleration.
+
+        Parameters:
+        -----------
+        txs : List[Dict]
+            List of transmitter specifications.
+        grid_x : np.ndarray
+            1D array of grid X coordinates.
+        grid_y : np.ndarray
+            1D array of grid Y coordinates.
+        freq_hz : float
+            Center frequency in Hz.
+        kdtree : any
+            KD-tree built from the point cloud for diffraction fallback.
+        point_cloud : np.ndarray
+            The input point cloud as an (N,3) array of XYZ coordinates.
+        coarse_plane_grid_m : float
+            Grid spacing in meters for coarse plane estimation.
+
+        Returns:
+        --------
+        np.ndarray
+            2D array of received signal strength in dBm over the grid.
+        """
+        # If CuPy is available, use it; otherwise, fall back to NumPy. CuPy has many NumPy-compatible functions that instead run on the GPU.
+        xp = cp if HAS_CUPY else np
+        use_cupy = HAS_CUPY
+
+        if grid_x is None or grid_y is None:
+            raise RuntimeError("Grid not set")
+
+        nx = len(grid_x); ny = len(grid_y); N = nx * ny
+        print(f"[GPU_SIM] compute_coverage_gpu: use_cupy={use_cupy} grid {nx}x{ny} => {N} cells")
+
+        # World coordinates. (numpy arrays for CPU tasks, xp arrays for GPU math)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+        grid_xy = np.column_stack((gx.ravel(), gy.ravel()))  # (N,2)
+
+        # Ground z per cell. (nearest neighbor from point cloud) - CPU
+        if kdtree is not None and point_cloud is not None and point_cloud.shape[0] > 0:
+            try:
+                _, idxs = kdtree.query(grid_xy, k=1)
+                grid_z = point_cloud[np.array(idxs, dtype=int), 2].astype(float)
+            except Exception as e:
+                print("[GPU_SIM] Warning: kdtree.query failed:", e)
+                grid_z = np.zeros((N,), dtype=float)
         else:
-            angles = []
-            gains = []
-            for p in azpat:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    angles.append(float(p[0]) % 360.0)
-                    gains.append(float(p[1]))
-            angles = np.array(angles, dtype=float)
-            gains = np.array(gains, dtype=float)
+            grid_z = np.zeros((N,), dtype=float)
 
-        if angles.size >= 2:
-            order = np.argsort(angles)
-            angs = angles[order]
-            g = gains[order]
-            # extend for wrap-around
-            angs_ext = np.concatenate([angs - 360.0, angs, angs + 360.0])
-            g_ext = np.concatenate([g, g, g])
-            az_gain_db = float(np.interp(az_abs, angs_ext, g_ext))
+        # Convert arrays to xp for GPU math.
+        grid_xp = xp.asarray(grid_xy[:, 0].astype(float))
+        grid_yp = xp.asarray(grid_xy[:, 1].astype(float))
+        grid_zp = xp.asarray(grid_z.astype(float))
+
+        eps = 1e-12
+        DEFAULT_MATERIAL_LOSS_DB = 15.0
+
+        # Helpers. (pattern interpolation remains CPU cause it's pretty cheap)
+        def parse_pattern(raw):
+            """
+            Parse antenna pattern from various formats into sorted list of (angle_deg, gain_db).
+
+            Parameters:
+            -----------
+            raw : various
+                Raw pattern input (dict, list of tuples, list of dicts, list of strings).
+            
+            Returns:
+            --------
+            List[Tuple[float, float]]
+                Sorted list of (angle_deg, gain_db) tuples.
+            """
+            out = []
+            if not raw:
+                return out
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    try:
+                        out.append((float(k) % 360.0, float(v)))
+                    except Exception:
+                        continue
+                out.sort(key=lambda x: x[0]); return out
+            if isinstance(raw, (list, tuple)):
+                for e in raw:
+                    try:
+                        if isinstance(e, (list, tuple)) and len(e) >= 2:
+                            out.append((float(e[0]) % 360.0, float(e[1]))); continue
+                        if isinstance(e, dict):
+                            if "angle" in e and "gain" in e:
+                                out.append((float(e["angle"]) % 360.0, float(e["gain"]))); continue
+                            vals = list(e.values())
+                            if len(vals) >= 2:
+                                out.append((float(vals[0]) % 360.0, float(vals[1]))); continue
+                        if isinstance(e, str):
+                            for sep in [',', ':', ' ']:
+                                if sep in e:
+                                    p = [s for s in e.split(sep) if s != '']
+                                    if len(p) >= 2:
+                                        out.append((float(p[0]) % 360.0, float(p[1]))); break
+                    except Exception:
+                        continue
+            out.sort(key=lambda x: x[0]); return out
+
+        def interp_pattern_scalar(pattern_list, angle_deg):
+            """
+            Interpolate antenna pattern gain at given angle in degrees.
+
+            Parameters:
+            -----------
+            pattern_list : List[Tuple[float, float]]
+                Sorted list of (angle_deg, gain_db) tuples.
+            angle_deg : float
+                Angle in degrees to interpolate gain for.
+            
+            Returns:
+            --------
+            float
+                Interpolated gain in dB.
+            """
+            if not pattern_list: return 0.0
+            angs = np.array([p[0] for p in pattern_list], dtype=float)
+            gains = np.array([p[1] for p in pattern_list], dtype=float)
+            angs_ext = np.concatenate((angs, angs[:1] + 360.0))
+            gains_ext = np.concatenate((gains, gains[:1]))
+            a = float(angle_deg) % 360.0
+            idx = np.searchsorted(angs_ext, a, side='right')
+            i1 = max(0, idx - 1); i2 = min(len(angs_ext) - 1, idx)
+            a1, a2 = angs_ext[i1], angs_ext[i2]; g1, g2 = gains_ext[i1], gains_ext[i2]
+            if abs(a2 - a1) < 1e-9: return float(g1)
+            frac = (a - a1) / (a2 - a1); return float(g1 + frac * (g2 - g1))
+
+        def knife_edge_loss_db(h, d1, d2, lam):
+            """
+            Compute knife-edge diffraction loss in dB.
+
+            Parameters:
+            -----------
+            h : float
+                Height of obstruction above line-of-sight in meters.
+            d1 : float
+                Distance from transmitter to obstruction in meters.
+            d2 : float
+                Distance from obstruction to receiver in meters.
+            lam : float
+                Wavelength in meters.
+          
+            Returns:
+            --------
+            float
+                Diffraction loss in dB.
+            """
+            if d1 <= 0 or d2 <= 0:
+                return 0.0
+            v = (h * np.sqrt(2.0 * (d1 + d2) / (lam * d1 * d2)))
+            if v <= -0.78:
+                return 0.0
+            val = 6.9 + 20.0 * np.log10(np.sqrt((v - 0.1)**2 + 1.0) + v - 0.1)
+            return max(0.0, float(val))
+
+        def kd_ray_sample_diffraction(origin_world, target_world, kdtree_local, pc_np, lam, n_samples=6, clearance_m=0.6):
+            """
+            Estimate diffraction loss using KD-tree ray sampling.
+
+            Parameters:
+            -----------
+            origin_world : np.ndarray
+                Transmitter origin point (3,).
+            target_world : np.ndarray
+                Receiver target points (M,3).
+            kdtree_local : any
+                KD-tree built from local point cloud.
+            pc_np : np.ndarray
+                Local point cloud as (N,3) array.
+            lam : float
+                Wavelength in meters.
+            n_samples : int
+                Number of samples along the ray.
+            clearance_m : float
+                Clearance radius in meters for KD-tree queries.
+            
+            Returns:
+            --------
+            np.ndarray
+                Array of diffraction losses in dB for each target point (M,).
+            """
+            # Identical to earlier robust fallback. (kept as CPU)
+            M = target_world.shape[0]
+            losses = np.zeros(M, dtype=float)
+            if kdtree_local is None or pc_np is None or pc_np.shape[0] == 0:
+                return losses
+            vecs = target_world - origin_world[None, :]
+            dists = np.linalg.norm(vecs, axis=1)
+            nz = dists > 1e-9
+            ts = np.linspace(0.1, 0.9, min(n_samples, 8))
+            for t in ts:
+                pts = origin_world[None, :] + vecs * t
+                try:
+                    idx_lists = kdtree_local.query_ball_point(pts[:, :2], r=clearance_m)
+                except Exception:
+                    d2, i2 = kdtree_local.query(pts[:, :2], k=1)
+                    idx_lists = [[int(i2[i])] for i, _ in enumerate(d2)]
+                for i, idxs in enumerate(idx_lists):
+                    if not idxs or not nz[i]:
+                        continue
+                    ray_z = pts[i, 2]
+                    zs = pc_np[np.array(idxs, dtype=int), 2]
+                    if zs.size and np.any(zs > ray_z + 0.05):
+                        hit_z = float(np.max(zs))
+                        d_total = dists[i]
+                        d1 = d_total * t
+                        d2 = d_total - d1
+                        los_z = origin_world[2] + (target_world[i, 2] - origin_world[2]) * (d1 / (d_total + eps))
+                        h = hit_z - los_z
+                        if h <= 0:
+                            continue
+                        Ld = knife_edge_loss_db(h, d1, d2, lam)
+                        mat_loss = DEFAULT_MATERIAL_LOSS_DB
+                        total = Ld + mat_loss
+                        if total > losses[i]:
+                            losses[i] = total
+            return losses
+
+        # Trimesh ray helpers. (CPU)
+        mesh = getattr(self, "mesh", None)
+        mesh_shift = np.asarray(getattr(self, "mesh_shift", np.zeros(3, dtype=float)), dtype=float)
+        has_trimesh = False
+        if mesh is not None:
+            try:
+                import trimesh
+                if isinstance(mesh, trimesh.Trimesh):
+                    has_trimesh = True
+                else:
+                    # Try to coerce.
+                    mesh = trimesh.Trimesh(vertices=np.asarray(mesh.vertices) - mesh_shift, faces=np.asarray(mesh.faces), process=False)
+                    has_trimesh = True
+            except Exception as e:
+                print("[GPU_SIM] trimesh unavailable for accelerated occlusion:", e)
+                has_trimesh = False
+
+        # --- COARSE PLANE CACHE (CPU) ---
+        # Build a coarse grid over the domain and estimate a local plane for each coarse cell.
+        coarse_grid_m = float(coarse_plane_grid_m)
+        # Bounding box of grid.
+        minx = float(np.min(grid_xy[:, 0])); maxx = float(np.max(grid_xy[:, 0]))
+        miny = float(np.min(grid_xy[:, 1])); maxy = float(np.max(grid_xy[:, 1]))
+        nx_coarse = max(1, int(np.ceil((maxx - minx) / coarse_grid_m)))
+        ny_coarse = max(1, int(np.ceil((maxy - miny) / coarse_grid_m)))
+        coarse_xs = np.linspace(minx, maxx, nx_coarse)
+        coarse_ys = np.linspace(miny, maxy, ny_coarse)
+        coarse_centers = np.array(np.meshgrid(coarse_xs, coarse_ys)).reshape(2, -1).T  # (M_coarse, 2)
+
+        # CPU function to estimate plane via PCA for one center. (uses KD-tree to find neighbors)
+        def estimate_plane_cpu(center_xy, k=48):
+            """
+            Estimate local plane at center_xy using k nearest neighbors from point_cloud via kdtree.
+
+            Parameters:
+            -----------
+            center_xy : np.ndarray
+                Center XY coordinate (2,).
+            k : int
+                Number of nearest neighbors to use.
+            
+            Returns:
+            --------
+            Tuple[np.ndarray, np.ndarray]
+                (centroid (3,), normal (3,)) of estimated plane, or (None, None) on failure.
+            """
+            if kdtree is None or point_cloud is None or point_cloud.shape[0] == 0:
+                return None, None
+            try:
+                dists, idxs = kdtree.query([center_xy], k=min(k, point_cloud.shape[0]))
+                idxs = np.array(idxs[0], dtype=int)
+                pts = point_cloud[idxs]
+                if pts.shape[0] < 6:
+                    return None, None
+                cen = np.mean(pts, axis=0)
+                cov = (pts - cen).T @ (pts - cen) / float(pts.shape[0])
+                w, v = np.linalg.eigh(cov)
+                normal = v[:, 0]
+                if normal[2] < 0:
+                    normal = -normal
+                normal = normal / (np.linalg.norm(normal) + eps)
+                return cen, normal
+            except Exception:
+                return None, None
+
+        # Compute coarse planes (CPU), cache results in arrays. (len = M_coarse)
+        coarse_pts = []
+        coarse_norms = []
+        for cc in coarse_centers:
+            pt, n = estimate_plane_cpu(cc, k=64)
+            if pt is None:
+                # Fallback to horizontal at median elevation near center from kdtree nearest.
+                if kdtree is not None and point_cloud is not None:
+                    try:
+                        d, i = kdtree.query([cc], k=1)
+                        p = point_cloud[int(i[0])]
+                        pt = p
+                        n = np.array([0.0, 0.0, 1.0])
+                    except Exception:
+                        pt = np.array([cc[0], cc[1], 0.0])
+                        n = np.array([0.0, 0.0, 1.0])
+                else:
+                    pt = np.array([cc[0], cc[1], 0.0])
+                    n = np.array([0.0, 0.0, 1.0])
+            coarse_pts.append(pt)
+            coarse_norms.append(n)
+        coarse_pts = np.vstack(coarse_pts)  # (M_coarse, 3)
+        coarse_norms = np.vstack(coarse_norms)  # (M_coarse, 3)
+
+        # Map each fine grid cell to the nearest coarse center index. (CPU)
+        from sklearn.neighbors import KDTree as SkKDTree  # Scikit-learn KDTree is usually available; if not, fallback to numpy.
+        try:
+            sktree = SkKDTree(coarse_centers)
+            _, coarse_idx = sktree.query(grid_xy, k=1)
+            coarse_idx = coarse_idx.ravel()
+        except Exception:
+            # Fallback brute force. (may be slower)
+            dists_coarse = np.sum((grid_xy[:, None, :] - coarse_centers[None, :, :])**2, axis=2)
+            coarse_idx = np.argmin(dists_coarse, axis=1)
+
+        # Upload coarse plane arrays to GPU. (xp)
+        coarse_pts_xp = xp.asarray(coarse_pts.astype(float))
+        coarse_norms_xp = xp.asarray(coarse_norms.astype(float))
+        coarse_idx_xp = xp.asarray(coarse_idx.astype(int))
+
+        # Batch settings for GPU work.
+        BATCH = 8192
+        rss_mw = xp.zeros(N, dtype=float)
+
+        # Small helper: Fresnel. (implemented using numpy functions but vectorizable on xp)
+        def fresnel_unpolarized_vec(inc_dirs_xp, normals_xp, eps_r):
+            """
+            Compute unpolarized Fresnel reflection coefficients (magnitude and sign) for vectors.
+
+            Parameters:
+            -----------
+            inc_dirs_xp : xp.ndarray
+                Incident direction vectors (M,3).
+            normals_xp : xp.ndarray
+                Surface normal vectors (M,3).
+            eps_r : float
+                Relative permittivity of the surface.
+            
+            Returns:
+            --------
+            Tuple[xp.ndarray, xp.ndarray]
+                (magnitude (M,), sign (M,)) of reflection coefficients.
+            """
+            # Ensure unit.
+            inc_u = inc_dirs_xp / (xp.linalg.norm(inc_dirs_xp, axis=1)[:, None] + eps)
+            n_u = normals_xp / (xp.linalg.norm(normals_xp, axis=1)[:, None] + eps)
+            cos_i = xp.clip(-xp.sum(inc_u * n_u, axis=1), -1.0, 1.0)
+            sin_i = xp.sqrt(xp.maximum(0.0, 1.0 - cos_i**2))
+            n1 = 1.0
+            n2 = xp.sqrt(float(eps_r))
+            sin_t = n1 / n2 * sin_i
+            # Handle total internal reflection cases: sin_t >=1 -> mag=1, sign=-1.
+            total_internal = sin_t >= 1.0
+            cos_t = xp.sqrt(xp.maximum(0.0, 1.0 - sin_t**2))
+            rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t + eps)
+            rp = (n2 * cos_i - n1 * cos_t) / (n2 * cos_i + n1 * cos_t + eps)
+            mag = 0.5 * (xp.abs(rs) + xp.abs(rp))
+            avg = 0.5 * (rs + rp)
+            sign = xp.where(xp.real(avg) < 0.0, -1.0, 1.0)
+            mag = xp.where(total_internal, 1.0, mag)
+            sign = xp.where(total_internal, -1.0, sign)
+            return mag, sign
+
+        # Main per-transmitter loop; heavy arithmetic uses xp and runs on GPU if cupy present.
+        for tx_idx, tx in enumerate(txs):
+            tx_x = float(tx.get("x", 0.0)); tx_y = float(tx.get("y", 0.0)); tx_h = float(tx.get("h_m", 2.0))
+            tx_power_dbm = float(tx.get("power_dbm", 20.0))
+            tx_freq = float(tx.get("freq_hz", freq_hz))
+            tx_ant_spec = tx.get("antenna_spec") if isinstance(tx.get("antenna_spec"), dict) else (tx.get("antenna_spec") or {})
+            tx_heading = float(tx.get("heading_deg", tx.get("heading", 0.0) or 0.0))
+            declared_gain = float(tx_ant_spec.get("gain_db", 0.0))
+            D = float(tx_ant_spec.get("aperture_m", tx_ant_spec.get("largest_dim_m", tx_ant_spec.get("diameter_m", 0.1))))
+            if D <= 0:
+                D = 0.1
+            fraunhofer_R = 2.0 * (D**2) / (C / tx_freq + eps)
+
+            # Reflection/fresnel defaults.
+            eps_r = float(tx.get("ground_eps_r", 6.0))
+            roughness = float(tx.get("ground_roughness_m", 0.02))
+            enable_reflection = bool(tx.get("enable_ground_reflection", True))
+            rx_aperture_m = float(tx.get("rx_aperture_m", 0.0))
+
+            # Pattern CPU precompute (per-cell dBi) -> then send to GPU.
+            azpat = parse_pattern(tx_ant_spec.get("azimuth_pattern") or tx_ant_spec.get("az_pattern") or [])
+            elpat = parse_pattern(tx_ant_spec.get("elevation_pattern") or tx_ant_spec.get("elevation") or [])
+            # Compute az/el CPU arrays. (fast)
+            az_abs = np.degrees(np.arctan2(np.asarray(grid_xy[:,1]) - tx_y, np.asarray(grid_xy[:,0]) - tx_x)) % 360.0
+            heading_bearing = (90.0 - tx_heading) % 360.0
+            rel_az = (az_abs - heading_bearing + 360.0) % 360.0
+            el_abs = np.degrees(np.arctan2(np.asarray(grid_z) - tx_h, np.sqrt((np.asarray(grid_xy[:,0]) - tx_x)**2 + (np.asarray(grid_xy[:,1]) - tx_y)**2)))
+
+            def pattern_gains_np(pat):
+                if not pat:
+                    return None
+                angs = np.array([p[0] for p in pat], dtype=float)
+                gains = np.array([p[1] for p in pat], dtype=float)
+                return angs, gains
+
+            az_parsed = pattern_gains_np(azpat)
+            el_parsed = pattern_gains_np(elpat)
+
+            az_vals_np = np.zeros(N, dtype=float)
+            if az_parsed is None:
+                az_vals_np[:] = declared_gain
+            else:
+                pat_peak = float(np.max(az_parsed[1]))
+                scale_offset = declared_gain - pat_peak
+                for i in range(N):
+                    az_vals_np[i] = interp_pattern_scalar(azpat, float(rel_az[i]))
+
+                az_vals_np += scale_offset
+
+            el_vals_np = np.zeros(N, dtype=float)
+            if el_parsed is None:
+                el_vals_np[:] = 0.0
+            else:
+                pat_peak_e = float(np.max(el_parsed[1]))
+                el_scale_offset = 0.0 if abs(pat_peak_e) <= 2.0 else (0.0 - pat_peak_e)
+                for i in range(N):
+                    el_vals_np[i] = interp_pattern_scalar(elpat, float(el_abs[i]))
+                el_vals_np += el_scale_offset
+
+            gain_db_np = az_vals_np + el_vals_np
+
+            # Move gain linear to GPU.
+            Gt_lin_xp = xp.asarray((10.0 ** (gain_db_np / 10.0)).astype(float))
+
+            # Frequency averaging.
+            def make_freq_list(center_f, tx_opts):
+                n = int(tx_opts.get("freq_averaging_n", 5))
+                frac = float(tx_opts.get("freq_averaging_frac", 0.005))
+                if n <= 1 or frac <= 0.0:
+                    return [center_f]
+                idx = np.linspace(-1.0, 1.0, n)
+                return list(center_f * (1.0 + idx * frac))
+
+            freq_list = make_freq_list(tx_freq, tx)
+
+            # Precompute kd-based diffraction losses (CPU) once per center frequency ideally, but it's not freq-dependent strongly.
+            # We'll compute kd_losses once (CPU) and transfer to GPU array for use as amplitude attenuation fallback when mesh unavailable.
+            if kdtree is not None and point_cloud is not None and point_cloud.shape[0] > 0:
+                # Use center frequency lam for diffraction estimate.
+                lam_center = C / float(tx_freq)
+                kd_losses_full = kd_ray_sample_diffraction(np.array([tx_x, tx_y, tx_h], dtype=float),
+                                                          np.column_stack((np.asarray(grid_xy[:,0]), np.asarray(grid_xy[:,1]), np.asarray(grid_z))),
+                                                          kdtree, point_cloud, lam_center, n_samples=8, clearance_m=0.6)
+            else:
+                kd_losses_full = np.zeros((N,), dtype=float)
+            kd_losses_xp = xp.asarray(kd_losses_full.astype(float))
+
+            # Accumulate frequency-averaged power in mW on GPU.
+            rss_mw_tx_acc = xp.zeros(N, dtype=float)
+
+            # For reflection: determine per-grid-plane normals from coarse cache (upload to GPU already)
+            # coarse_idx_xp maps each fine cell to coarse plane index; coarse_pts_xp, coarse_norms_xp available.
+            for f in freq_list:
+                lam = C / float(f)
+                k = 2.0 * np.pi / lam
+                # Batch loop - do heavy math on GPU.
+                for s in range(0, N, BATCH):
+                    e = min(N, s + BATCH)
+
+                    # Gather batch coords on GPU. (xp arrays)
+                    bx = grid_xp[s:e]; by = grid_yp[s:e]; bz = grid_zp[s:e]
+                    idxs = xp.arange(s, e, dtype=int)
+
+                    # Direct path geometry. (GPU)
+                    dx = bx - float(tx_x); dy = by - float(tx_y); dz = bz - float(tx_h)
+                    dist_direct = xp.sqrt(dx*dx + dy*dy + dz*dz) + eps
+                    R_eff_direct = xp.maximum(dist_direct, float(fraunhofer_R))
+
+                    # Direct occlusion: prefer trimesh (CPU) check; if trimesh exists we do the per-batch ray test on CPU
+                    # but we move its boolean result to GPU as occlusion mask; otherwise use kd_losses_xp slice.
+                    if has_trimesh and mesh is not None:
+                        # Build CPU ray origins/directions for batch.
+                        # NOTE: we perform this CPU ray test once per batch to avoid thousands of small CPU calls.
+                        origins = np.tile(np.array([tx_x, tx_y, tx_h]) - mesh_shift, (e - s, 1))
+                        dirs = np.vstack((xp.asnumpy(bx) - tx_x, xp.asnumpy(by) - tx_y, xp.asnumpy(bz) - tx_h)).T
+                        dir_norms = np.linalg.norm(dirs, axis=1) + eps
+                        dirs_unit = dirs / dir_norms[:, None]
+                        try:
+                            # Intersects_first returns distances array. (numpy)
+                            d_first = mesh.ray.intersects_first(origins=origins, directions=dirs_unit)
+                            occluded_mask = np.logical_and(np.isfinite(d_first), d_first < (dir_norms - 1e-6))
+                            occlusion_loss_db_direct = np.where(occluded_mask, DEFAULT_MATERIAL_LOSS_DB, 0.0).astype(float)
+                        except Exception:
+                            # Fallback coarse: if any intersection exists mark occluded.
+                            try:
+                                any_hit = mesh.ray.intersects_any(origins=origins, directions=dirs_unit)
+                                occlusion_loss_db_direct = np.where(any_hit, DEFAULT_MATERIAL_LOSS_DB, 0.0).astype(float)
+                            except Exception:
+                                occlusion_loss_db_direct = kd_losses_full[s:e]
+                    else:
+                        # Use kd-based losses.
+                        occlusion_loss_db_direct = np.asarray(kd_losses_full[s:e]).astype(float)
+
+                    # Move occlusion to GPU.
+                    occl_db_direct_xp = xp.asarray(occlusion_loss_db_direct.astype(float))
+
+                    # Complex direct field. (GPU)
+                    Pt_w = (10.0 ** (tx_power_dbm / 10.0)) / 1000.0
+                    amp_pref_direct = xp.sqrt(Pt_w * Gt_lin_xp[s:e] * 1.0) * (lam / (4.0 * xp.pi * R_eff_direct))
+                    amp_factor_direct = 10.0 ** (-occl_db_direct_xp / 20.0)
+                    phase_direct = xp.exp(-1j * (2.0 * xp.pi / lam) * dist_direct)
+                    E_direct = amp_pref_direct * amp_factor_direct * phase_direct
+
+                    # Reflected path. (GPU math, CPU plane & mesh decisions)
+                    if enable_reflection:
+                        # Get coarse plane index slice. (GPU -> but coarse_idx_xp is xp already)
+                        coarse_ids = coarse_idx_xp[s:e]  # xp int array
+                        # Fetch coarse points/normals for batch. (xp index gather)
+                        plane_pts_batch = coarse_pts_xp[coarse_ids]  # (batch,3)
+                        plane_norms_batch = coarse_norms_xp[coarse_ids]  # (batch,3)
+
+                        # Compute image source coordinates on GPU: image = tx - 2 * dot(v, normal) * normal.
+                        tx_origin_xp = xp.asarray(np.array([tx_x, tx_y, tx_h], dtype=float))
+                        vtx = tx_origin_xp[None, :] - plane_pts_batch  # (batch,3)
+                        proj = xp.sum(vtx * plane_norms_batch, axis=1)[:, None]  # (batch,1)
+                        image_tx_batch = tx_origin_xp[None, :] - 2.0 * proj * plane_norms_batch  # (batch,3)
+
+                        # Path from image to receiver. (GPU)
+                        rx_pts_batch = xp.stack((bx, by, bz), axis=1)  # (batch,3)
+                        vec_img_rx = rx_pts_batch - image_tx_batch
+                        dist_img_rx = xp.linalg.norm(vec_img_rx, axis=1) + eps
+                        R_eff_refl = xp.maximum(dist_img_rx, float(fraunhofer_R))
+
+                        # For occlusion of reflected ray: we need a CPU mesh ray test per batch because mesh.ray is CPU-only.
+                        # We'll prepare per-batch origins/directions on CPU and query mesh.ray for intersections,
+                        # then transfer boolean occlusion mask to GPU.
+                        if has_trimesh and mesh is not None:
+                            # Prepare CPU arrays of origins/directions. (image_tx_batch -> numpy)
+                            try:
+                                img_origins_cpu = xp.asnumpy(image_tx_batch) + mesh_shift  # Account for mesh_shift invert earlier usage.
+                                img_dirs_cpu = xp.asnumpy(vec_img_rx)
+                                img_dir_norms = np.linalg.norm(img_dirs_cpu, axis=1) + eps
+                                img_dirs_unit_cpu = img_dirs_cpu / img_dir_norms[:, None]
+                                # Intersects_first gives first-hit distance per ray. (numpy)
+                                try:
+                                    d_first_refl = mesh.ray.intersects_first(origins=img_origins_cpu, directions=img_dirs_unit_cpu)
+                                    occluded_refl_mask = np.logical_and(np.isfinite(d_first_refl), d_first_refl < (img_dir_norms - 1e-6))
+                                    occl_db_refl = np.where(occluded_refl_mask, DEFAULT_MATERIAL_LOSS_DB, 0.0).astype(float)
+                                except Exception:
+                                    any_hit_refl = mesh.ray.intersects_any(origins=img_origins_cpu, directions=img_dirs_unit_cpu)
+                                    occl_db_refl = np.where(any_hit_refl, DEFAULT_MATERIAL_LOSS_DB, 0.0).astype(float)
+                            except Exception as ex:
+                                # Trimesh per-batch failed: fallback to kd-based loss for reflected path.
+                                occl_db_refl = np.asarray(kd_losses_full[s:e]).astype(float)
+                        else:
+                            occl_db_refl = np.asarray(kd_losses_full[s:e]).astype(float)
+
+                        # Move occlusion to GPU.
+                        occl_db_refl_xp = xp.asarray(occl_db_refl.astype(float))
+
+                        # Incidence vectors (GPU): approximate incident vector from tx->plane_pt. (plane_pt = plane_pts_batch)
+                        inc_vec = (plane_pts_batch - tx_origin_xp[None, :])  # (batch,3)
+                        # Compute Fresnel magnitude & sign on GPU.
+                        refl_mag_xp, refl_sign_xp = fresnel_unpolarized_vec(inc_vec, plane_norms_batch, eps_r)
+
+                        # Roughness spec factor (GPU) approximate.
+                        cos_i = xp.clip(-xp.sum((inc_vec / (xp.linalg.norm(inc_vec, axis=1)[:, None] + eps)) * plane_norms_batch, axis=1), -1.0, 1.0)
+                        sin_i = xp.sqrt(xp.maximum(0.0, 1.0 - cos_i**2))
+                        spec_factor_xp = xp.exp(- (4.0 * xp.pi * roughness * sin_i / (lam + eps))**2)
+
+                        # Amplitude prefactor for reflected path (GPU)
+                        # and convert per-cell Gt to xp slice.
+                        Gt_lin_batch = Gt_lin_xp[s:e]
+                        amp_pref_refl = xp.sqrt(Pt_w * Gt_lin_batch * 1.0) * (lam / (4.0 * xp.pi * R_eff_refl))
+                        amp_factor_refl = 10.0 ** (-occl_db_refl_xp / 20.0)
+                        # Combine reflection amplitude: refl_mag * spec_factor * sign.
+                        refl_complex_factor = (refl_mag_xp * spec_factor_xp) * refl_sign_xp
+                        # Phase for reflected path uses image->rx distance.
+                        phase_refl = xp.exp(-1j * (2.0 * xp.pi / lam) * dist_img_rx)
+                        E_refl = amp_pref_refl * amp_factor_refl * phase_refl * refl_complex_factor
+                    else:
+                        E_refl = xp.zeros(e - s, dtype=complex)
+
+                    # Coherent sum for this batch.
+                    E_batch = E_direct + E_refl
+
+                    # Power (W)
+                    Pr_batch_w = xp.abs(E_batch) ** 2
+                    rss_mw_tx_acc[s:e] += (Pr_batch_w * 1000.0)
+
+            # Frequency average on GPU.
+            rss_mw_tx = rss_mw_tx_acc / float(len(freq_list))
+
+            # Optional receiver aperture smoothing: do on GPU by convolving with a small kernel if aperture>0.
+            if rx_aperture_m > 0.0:
+                # Crude GPU smoothing: perform a per-point average of neighbors whose XY distance <= aperture using grid indexing
+                # For simplicity and performance we resample grid to 2D image and run a gaussian blur using FFT if available (cupy has FFT).
+                # Only do this if nx,ny sensible and xp supports FFT; otherwise fallback to CPU average.
+                try:
+                    # Reshape to 2D (ny,nx)
+                    img = rss_mw_tx.reshape((ny, nx))
+                    # Compute gaussian kernel sigma in pixels approximated by aperture / grid spacing.
+                    dx = (grid_x[1] - grid_x[0]) if nx > 1 else 1.0
+                    dy = (grid_y[1] - grid_y[0]) if ny > 1 else 1.0
+                    sigma_x = max(1.0, rx_aperture_m / (dx + eps))
+                    sigma_y = max(1.0, rx_aperture_m / (dy + eps))
+                    # Separable gaussian using FFT: create gaussian kernel in freq domain.
+                    # Create coords.
+                    ax = xp.fft.fftfreq(nx)[:, None]
+                    ay = xp.fft.fftfreq(ny)[None, :]
+                    # Build gaussian in frequency domain. (approx)
+                    # NOTE: simpler: use cupyx.scipy.ndimage.gaussian_filter if cupy + cupyx installed; else fallback.
+                    try:
+                        import cupyx.scipy.ndimage as cnd
+                        img_sm = cnd.gaussian_filter(img, sigma=(sigma_y, sigma_x))
+                    except Exception:
+                        # Fallback: no cupyx gaussian; do a naive uniform blur with small kernel. (slower)
+                        kx = max(1, int(round(rx_aperture_m / (dx + eps))))
+                        ky = max(1, int(round(rx_aperture_m / (dy + eps))))
+                        kernel = xp.ones((2*ky+1, 2*kx+1), dtype=float)
+                        kernel = kernel / xp.sum(kernel)
+                        # Separable conv via fft. (if xp supports fft)
+                        try:
+                            img_padded = img
+                            # Naive convolution: apply via scipy equivalent not available -> skip heavy smoothing.
+                            img_sm = img  # Fallback: no smoothing.
+                        except Exception:
+                            img_sm = img
+                    rss_mw_tx = img_sm.ravel()
+                except Exception:
+                    # Fallback: no GPU smoothing available.
+                    pass
+
+            # Accumulate over transmitters. (incoherent)
+            rss_mw += rss_mw_tx
+
+        # Finalize: to dBm and back to numpy.
+        rss_mw = xp.maximum(rss_mw, 1e-12)
+        rss_dbm = 10.0 * xp.log10(rss_mw)
+        if use_cupy:
+            out = xp.asnumpy(rss_dbm).reshape((ny, nx))
         else:
-            az_gain_db = peak_db
-    else:
-        # Gaussian horizontal model (-3 dB at HPBW/2)
-        hp_bw = float(spec.get("hp_bw_deg", spec.get("hp_bw", 90.0)))
-        half = max(1e-3, hp_bw / 2.0)
-        rel_linear = math.exp(-math.log(2.0) * (az_diff / half) ** 2)
-        rel_linear = max(rel_linear, 1e-12)
-        rel_db = 10.0 * math.log10(rel_linear)
-        az_gain_db = peak_db + rel_db
+            out = rss_dbm.reshape((ny, nx))
 
-    # Hard null
-    hp_bw = float(spec.get("hp_bw_deg", spec.get("hp_bw", 90.0)))
-    half = max(1e-3, hp_bw / 2.0)
-    if hard_null and az_diff > half:
-        return peak_db - 120.0
+        print("[GPU_SIM] compute_coverage_gpu done, shape=", out.shape)
+        return out
 
-    # enforce floor based on forward/back or sidelobe spec
-    min_allowed_db = peak_db - abs(fwd_back_db)
-    sidelobe_floor_db = peak_db + sidelobe_db
-    az_gain_db = max(az_gain_db, min_allowed_db, sidelobe_floor_db)
-
-    # -----------------------
-    # VERTICAL / ELEVATION TAPER
-    # -----------------------
-    # Use tx_ground_z and rx_ground_z if provided (set by caller)
-    tx_ground_z = float(tx.get("tx_ground_z", 0.0))
-    rx_ground_z = float(tx.get("rx_ground_z", 0.0))
-    tx_h = float(tx.get("h_m", 2.0))
-    tx_z_abs = tx_ground_z + tx_h
-    # approximate rx z
-    rx_z_abs = float(tx.get("rx_abs_z", rx_ground_z))
-    dz = rx_z_abs - tx_z_abs
-    horiz = math.hypot(dx, dy)
-    if horiz <= 1e-6:
-        elev_deg = 0.0
-    else:
-        elev_deg = math.degrees(math.atan2(dz, horiz))
-
-    vert_rel_db = 0.0
-    vpat = spec.get("elevation_pattern")
-    if vpat:
-        if isinstance(vpat, dict) and "angles" in vpat and "gains" in vpat:
-            v_angles = np.array(vpat["angles"], dtype=float)
-            v_gains = np.array(vpat["gains"], dtype=float)
-        else:
-            v_angles = []
-            v_gains = []
-            for p in vpat:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    v_angles.append(float(p[0]))
-                    v_gains.append(float(p[1]))
-            v_angles = np.array(v_angles, dtype=float) if v_angles else np.array([])
-            v_gains = np.array(v_gains, dtype=float) if v_gains else np.array([])
-
-        if v_angles.size >= 2:
-            vert_val_db = float(np.interp(elev_deg, v_angles, v_gains))
-            boresight_db = float(np.interp(0.0, v_angles, v_gains))
-            vert_rel_db = vert_val_db - boresight_db
-        else:
-            vert_rel_db = 0.0
-    else:
-        vp_bw = float(spec.get("vp_bw_deg", spec.get("vp_bw", 90.0)))
-        half_v = max(1e-3, vp_bw / 2.0)
-        rel_linear_v = math.exp(-math.log(2.0) * (elev_deg / half_v) ** 2)
-        rel_linear_v = max(rel_linear_v, 1e-12)
-        vert_rel_db = 10.0 * math.log10(rel_linear_v)
-
-    # -----------------------
-    # COMBINE
-    # -----------------------
-    total_gain_db = az_gain_db + vert_rel_db
-    return float(total_gain_db)
 
 # ------------------------
-# DB / point cloud loader (streaming + reservoir sampling for server-side)
+# DB / point cloud loader
 # ------------------------
 def load_pointcloud_from_db(db_path: str,
                            bbox: Optional[Tuple[float,float,float,float]] = None,
                            max_points: Optional[int] = None,
                            max_server_points: int = 1500000) -> Tuple[np.ndarray, List[Dict]]:
     """
-    Stream rows from the DB and optionally reservoir-sample to max_points for client
-    or to max_server_points for server use.
-    - If max_points is provided, returns at most max_points rows (sampled).
-    - Otherwise caps server-side returned points to max_server_points.
-    Returns (points_array Nx3, metadata list) where points_array are the sampled points.
+    Load and optionally sample point cloud from SQLite database within a bounding box.
+
+    Parameters:
+    -----------
+    db_path : str
+        Path to the SQLite database file.
+    bbox : Optional[Tuple[float,float,float,float]]
+        Bounding box (min_x, min_y, max_x, max_y) to filter points
+        from. If None, load all points.
+    max_points : Optional[int]
+        Maximum number of points to sample and return.
+    max_server_points : int
+        Maximum number of points to sample if max_points is None.
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, List[Dict]]
+        A tuple containing:
+        - pts : np.ndarray
+            Array of shape (M, 3) with sampled point coordinates.
+        - meta : List[Dict]
+            List of metadata dictionaries for each sampled point.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = None
-    # speed up pragmas for bulk read (safe for read-only usage)
     try:
         conn.execute("PRAGMA temp_store = MEMORY;")
         conn.execute("PRAGMA mmap_size = 30000000000;")
@@ -468,12 +1026,25 @@ def load_pointcloud_from_db(db_path: str,
     return pts, sampled_meta
 
 # ------------------------
-# Full-resolution stream endpoint generator (NDJSON)
+# Full-resolution stream endpoint generator (NDJSON) - preserved
 # ------------------------
 def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,float], fetch_size: int = 10000):
     """
-    Yield newline-delimited JSON lines: one point per line: {"x": x, "y": y, "z": z}
-    Final line is metadata: {"_meta": {"centroid": [...], "bounds":[minx,maxx,miny,maxy,minz,maxz], "count": N}}
+    Generator that streams full-resolution LiDAR points from the database within a bounding box as NDJSON.
+
+    Parameters:
+    -----------
+    db_path : str
+        Path to the SQLite database file.
+    bbox : Tuple[float,float,float,float]
+        Bounding box (min_x, min_y, max_x, max_y) to filter points
+    fetch_size : int
+        Number of rows to fetch per database query.
+    
+    Yields:
+    -------
+    bytes
+        Encoded NDJSON lines for each point and a final metadata line.
     """
     minx, miny, maxx, maxy = bbox
     conn = sqlite3.connect(db_path)
@@ -489,7 +1060,6 @@ def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,flo
         c.execute(q, params)
     except Exception as e:
         conn.close()
-        # yield no rows: error will be handled by response
         return
 
     total = 0
@@ -520,230 +1090,30 @@ def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,flo
     conn.close()
 
 # ------------------------
-# Occlusion test utilities (worker-side)
-# ------------------------
-def estimate_obstruction_loss_local(tx: Tuple[float,float,float],
-                                    rx: Tuple[float,float,float],
-                                    kdtree,
-                                    pts_local: np.ndarray,
-                                    sample_step_m: float = 1.0,
-                                    blocker_radius_m: float = 0.5,
-                                    per_blocker_db: float = 12.0) -> float:
-    tx = np.array(tx)
-    rx = np.array(rx)
-    vec = rx - tx
-    dist = np.linalg.norm(vec)
-    if dist < 1e-3:
-        return 0.0
-    dirv = vec / dist
-    n_samples = max(1, int(math.ceil(dist / sample_step_m)))
-    blocker_count = 0
-    for i in range(1, n_samples):
-        t = i / float(n_samples)
-        sample_pos = tx + dirv * (t * dist)
-        expected_height = tx[2] + (rx[2] - tx[2]) * t
-        idxs = kdtree.query_ball_point(sample_pos[:2], blocker_radius_m)
-        if not idxs:
-            continue
-        heights = pts_local[idxs][:,2]
-        if np.any(heights > expected_height + 0.25):
-            blocker_count += 1
-    if blocker_count == 0:
-        return 0.0
-    return per_blocker_db * math.sqrt(blocker_count)
-
-# ------------------------
-# Worker globals & initializer (updated to also accept grid arrays)
-# ------------------------
-_WORKER_PTS = None
-_WORKER_KDTREE = None
-_WORKER_GRID_X = None
-_WORKER_GRID_Y = None
-
-def _worker_init(pts: np.ndarray, grid_x=None, grid_y=None):
-    """
-    Worker initializer: each worker gets its own local copy reference and builds KD-tree.
-    grid_x, grid_y are optional lists/arrays of grid coordinates so workers can map
-    ix/iy -> world coordinates without receiving them per-task.
-    """
-    global _WORKER_PTS, _WORKER_KDTREE, _WORKER_GRID_X, _WORKER_GRID_Y
-    _WORKER_PTS = pts
-    _WORKER_GRID_X = None
-    _WORKER_GRID_Y = None
-    if grid_x is not None:
-        # convert to Python list for safe pickling / memory sharing
-        try:
-            _WORKER_GRID_X = list(grid_x)
-            _WORKER_GRID_Y = list(grid_y)
-        except Exception:
-            # fallback: convert via numpy
-            _WORKER_GRID_X = list(np.array(grid_x).tolist())
-            _WORKER_GRID_Y = list(np.array(grid_y).tolist())
-    if pts is None or pts.size == 0:
-        _WORKER_KDTREE = None
-    else:
-        xy = pts[:, :2]
-        try:
-            _WORKER_KDTREE = KDTree(xy)
-        except Exception:
-            _WORKER_KDTREE = KDTree(xy.tolist())
-
-# ------------------------
-# Worker computation (adjusted to use worker-global grid arrays)
-# ------------------------
-def _compute_rssi_chunk(chunk_args):
-    (txs, nx, ny, idx_start, idx_end, default_freq_hz, tx_power_dbm, sample_step_m) = chunk_args
-    pts_local = _WORKER_PTS
-    kdtree_local = _WORKER_KDTREE
-    grid_x_local = _WORKER_GRID_X
-    grid_y_local = _WORKER_GRID_Y
-
-    if pts_local is None or pts_local.shape[0] == 0 or kdtree_local is None:
-        return (idx_start, [-999.0] * (idx_end - idx_start))
-    if grid_x_local is None or grid_y_local is None:
-        return (idx_start, [-999.0] * (idx_end - idx_start))
-
-    rssi_out = []
-    for flat_idx in range(idx_start, idx_end):
-        iy = flat_idx // nx
-        ix = flat_idx % nx
-        # get world coords for this grid cell from worker-local lists
-        try:
-            gx = float(grid_x_local[ix])
-            gy = float(grid_y_local[iy])
-        except Exception:
-            # defensive fallback to zeros if indexing fails
-            gx = 0.0
-            gy = 0.0
-
-        try:
-            _, nn = kdtree_local.query([gx, gy], k=1)
-            z_ground = float(pts_local[int(nn)][2])
-        except Exception:
-            z_ground = float(np.median(pts_local[:,2]))
-        best_rssi = -999.0
-        for tx in txs:
-            tx_x = float(tx["x"])
-            tx_y = float(tx["y"])
-            tx_h = float(tx.get("h_m", 2.0))
-            tx_p = float(tx.get("power_dbm", tx_power_dbm))
-            freq_hz = float(tx.get("freq_hz", default_freq_hz))
-            try:
-                _, tnn = kdtree_local.query([tx_x, tx_y], k=1)
-                ground_tx_z = float(pts_local[int(tnn)][2])
-            except Exception:
-                ground_tx_z = float(np.median(pts_local[:,2]))
-            tx_z = ground_tx_z + tx_h
-            dxy = math.hypot(gx - tx_x, gy - tx_y)
-            d3 = math.sqrt(max(1e-6, dxy**2 + (z_ground - tx_z)**2))
-            fspl_val = fspl_db(d3, freq_hz)
-
-            # pass ground heights into antenna pattern so elevation is meaningful
-            tx_for_pattern = dict(tx)
-            tx_for_pattern['tx_ground_z'] = ground_tx_z
-            tx_for_pattern['rx_ground_z'] = z_ground
-            tx_for_pattern['rx_abs_z'] = z_ground  # receiver assumed ground for grid points
-
-            ant_gain = antenna_pattern_gain_db(tx_for_pattern, gx, gy)
-            obs_loss = estimate_obstruction_loss_local((tx_x, tx_y, tx_z), (gx, gy, z_ground), kdtree_local, pts_local,
-                                                       sample_step_m=sample_step_m,
-                                                       blocker_radius_m=1.0,
-                                                       per_blocker_db=12.0)
-            rssi_val = tx_p + ant_gain - fspl_val - obs_loss
-            if rssi_val > best_rssi:
-                best_rssi = rssi_val
-        rssi_out.append(float(best_rssi))
-    return (idx_start, rssi_out)
-
-# ------------------------
-# Parallel orchestrator
-# ------------------------
-def compute_rssi_grid_parallel(txs: List[Dict],
-                               grid_x: np.ndarray,
-                               grid_y: np.ndarray,
-                               default_freq_hz: float,
-                               executor: ProcessPoolExecutor,
-                               num_workers: int,
-                               tx_power_dbm: float = 20.0,
-                               sample_step_m: float = 2.0) -> np.ndarray:
-    nx = len(grid_x)
-    ny = len(grid_y)
-    total = nx * ny
-    if total == 0:
-        return np.full((ny, nx), -999.0, dtype=float)
-    n_tasks = max(num_workers * 2, num_workers)
-    chunk_size = max(1, int(math.ceil(total / float(n_tasks))))
-    tasks = []
-    for i in range(0, total, chunk_size):
-        start = i
-        end = min(total, i + chunk_size)
-        # reduced per-task args (grid arrays are provided in worker initializer)
-        tasks.append((txs, nx, ny, start, end, float(default_freq_hz), float(tx_power_dbm), float(sample_step_m)))
-    futures = [executor.submit(_compute_rssi_chunk, t) for t in tasks]
-    rssi_flat = [-999.0] * total
-
-    completed = 0
-    total_futs = len(futures)
-    loop = None
-    try:
-        loop = asyncio.get_event_loop()
-    except Exception:
-        loop = None
-
-    for fut in as_completed(futures):
-        try:
-            idx_start, rlist = fut.result()
-            rssi_flat[idx_start:idx_start + len(rlist)] = rlist
-        except Exception as e:
-            print("Worker failed:", e)
-        completed += 1
-        # compute percent
-        try:
-            percent = int((completed / float(total_futs)) * 100.0)
-        except Exception:
-            percent = 0
-        # schedule non-blocking broadcast of progress
-        try:
-            if loop and loop.is_running():
-                loop.create_task(broadcast_message(json.dumps({"type": "sim_progress", "percent": percent})))
-        except Exception:
-            pass
-
-    # final 100% broadcast
-    try:
-        if loop and loop.is_running():
-            loop.create_task(broadcast_message(json.dumps({"type": "sim_progress", "percent": 100})))
-    except Exception:
-        pass
-
-    rss_grid = np.array(rssi_flat, dtype=float).reshape((ny, nx))
-    return rss_grid
-
-# ------------------------
-# FastAPI app + websockets (UI unchanged from prior)
+# FastAPI app + websockets (ORIGINAL GUI FULLY PRESERVED)
 # ------------------------
 app = FastAPI()
-# GZip for large transfers
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 connected_websockets: List[WebSocket] = []
 
 DB_PATH = None
 
-# Full HTML page (client)
-# Important: this HTML listens for sim_progress and streams /pointcloud_full progressively.
+# Initialize GPU simulator
+gpu_simulator = GPURFSimulator()
+
+# Full HTML page (client) - ORIGINAL PRESERVED
 HTML_PAGE = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>LiDAR RF Viewer (on-demand + antenna)</title>
+  <title>LiDAR RF Viewer</title>
   <style>
     body { margin:0; overflow:hidden; background:#0b0b0b; color:#eee; font-family: Arial, sans-serif; }
     #overlay { position:absolute; top:8px; left:8px; z-index:20; background:rgba(255,255,255,0.95); color:#000; padding:10px; border-radius:6px; width:420px; max-height:92vh; overflow:auto; }
     #legend { margin-top:8px; padding:6px; background:#fff; border-radius:4px; font-size:12px; color:#000; }
-    .color-bar { height:14px; width:100%; border-radius:4px; background: linear-gradient(to right, rgb(200,0,0), rgb(255,200,0), rgb(0,180,0)); display:block; margin-bottom:6px; }
-    .legend-row { display:flex; justify-content:space-between; font-size:12px; margin-bottom:2px; }
+    .color-bar {height: 14px; width: 100%; border-radius: 4px; background: linear-gradient(to right, rgb(0, 0, 0), rgb(255, 0, 0),rgb(255, 255, 0),rgb(0, 255, 0),rgb(0, 0, 255)); display: block; margin-bottom: 6px; }    .legend-row { display:flex; justify-content:space-between; font-size:12px; margin-bottom:2px; }
     label { display:inline-block; width:160px; font-size:13px; vertical-align: middle; }
     input[type="number"], input[type="text"], select { width:220px; }
     .config-row { margin-bottom:6px; display:flex; align-items:center; }
@@ -754,11 +1124,14 @@ HTML_PAGE = r"""
     .tx-group label { color: #000; }
     #progressBarContainer { width:100%; background:#ddd; border-radius:6px; overflow:hidden; margin-top:6px; display:none; }
     #progressBar { height:12px; width:0%; background:#4caf50; }
+    #gpuStatus { color: #0066cc; font-weight: bold; }
+    .status-good { color: #00aa00; }
+    .status-warn { color: #ff8800; }
   </style>
 </head>
 <body>
 <div id="overlay">
-  <div><b>LiDAR RF Viewer — On-demand</b></div>
+  <div><b>LiDAR RF Viewer</b> <span id="gpuStatus">(Checking GPU...)</span></div>
 
   <div style="margin-top:8px;">
     <label>UTM Easting</label><input id="utm_e" type="number" step="0.01" value="0"/><br/>
@@ -789,7 +1162,6 @@ HTML_PAGE = r"""
       <option value="__loading__">Loading...</option>
     </select><br/>
     <div id="ant_config_editor" style="margin-top:8px;">
-      <!-- Dynamically generated config fields will appear here -->
       <div class="config-note">Select an antenna config to edit its fields (the editor mirrors the config file).</div>
     </div>
 
@@ -808,7 +1180,7 @@ HTML_PAGE = r"""
 
     <div style="margin-top:6px;">
       <button id="addTx">Add transmitter (click scene)</button>
-      <button id="simulate">Simulate</button>
+      <button id="simulate">Simulate (with Occlusion)</button>
     </div>
   </div>
 
@@ -816,15 +1188,17 @@ HTML_PAGE = r"""
 
   <div><b>Clients:</b> <span id="clients">0</span></div>
   <div><b>Loaded points:</b> <span id="ptcount">0</span></div>
+  <div><b>Simulation status:</b> <span id="simStatus">Ready</span></div>
 
   <div id="progressBarContainer"><div id="progressBar"></div></div>
 
   <div id="legend">
     <div class="color-bar"></div>
-    <div class="legend-row"><span><b>Green</b> — Strong (≥ -60 dBm)</span><span>-60 dBm</span></div>
-    <div class="legend-row"><span><b>Yellow</b> — Questionable (-80 to -60 dBm)</span><span>-80 dBm</span></div>
-    <div class="legend-row"><span><b>Red</b> — Poor (-100 to -80 dBm)</span><span>-100 dBm</span></div>
-    <div class="legend-row"><span><b>Black</b> — No signal (≤ -100 dBm)</span><span>&lt;= -100</span></div>
+    <div class="legend-row"><span><b>Blue</b> - Excellent (≥ -55 dBm)</span><span>-55 dBm</span></div>
+    <div class="legend-row"><span><b>Green</b> - Good (-65 to -56 dBm)</span><span>-65 dBm</span></div>
+    <div class="legend-row"><span><b>Yellow</b> - Fair (-75 to -66 dBm)</span><span>-75 dBm</span></div>
+    <div class="legend-row"><span><b>Red</b> - Poor (-85 to -76 dBm)</span><span>-85 dBm</span></div>
+    <div class="legend-row"><span><b>Black</b> - Unusable (≤ -86 dBm)</span><span>&lt;= -86</span></div>
   </div>
 </div>
 
@@ -847,7 +1221,7 @@ let pointCloud = [], centroid = [0,0,0], bounds = [0,0,0,0,0,0];
 let ws;
 let adding = false;
 let txVisuals = [];
-let antennaSpecsCache = {}; // name -> full spec object
+let antennaSpecsCache = {};
 
 async function loadAntennaConfigs(){
   try{
@@ -867,7 +1241,6 @@ async function loadAntennaConfigs(){
       opt.innerText = `${c.name} (${c.type || 'unknown'})`;
       sel.appendChild(opt);
     }
-    // fetch and cache full specs for select's options
     for(const c of data){
       try{
         const r = await fetch(`/antenna_config/${encodeURIComponent(c.name)}`);
@@ -881,7 +1254,6 @@ async function loadAntennaConfigs(){
         antennaSpecsCache[c.name] = { name: c.name, model: c.model || '', type: c.type || '', note: 'fetch error' };
       }
     }
-    // Set selection to first and render editor
     sel.selectedIndex = 0;
     renderAntConfigEditor(antennaSpecsCache[sel.value]);
     sel.onchange = ()=>{
@@ -954,7 +1326,6 @@ function renderAntConfigEditor(spec){
   container.appendChild(note);
 }
 
-// safe helper to gather editor values (not used directly, but available)
 function getEditorValuesForSpec(){
   const container = document.getElementById('ant_config_editor');
   const inputs = container.querySelectorAll('[id^="cfg_"]');
@@ -981,33 +1352,46 @@ function safeGet(url){
   });
 }
 
-function rssi_to_rgb(rssi){
-  if(rssi <= -100) return [0,0,0];
-  const t = Math.min(1, Math.max(0, (rssi + 100) / 40.0));
-  let r=0,g=0,b=0;
-  if(t < 0.5){
-    const u = t / 0.5;
-    r = 1.0; g = u; b = 0.0;
-  } else {
-    const u = (t - 0.5) / 0.5;
-    r = 1.0 - u; g = 1.0; b = 0.0;
+function rssi_to_rgb(rssi) {
+  // Define RSSI breakpoints and corresponding RGB colors
+  const levels = [
+    { rssi: -100, color: [0, 0, 0] },     // Black (Unusable)
+    { rssi: -85,  color: [1, 0, 0] },     // Red (Poor)
+    { rssi: -75,  color: [1, 1, 0] },     // Yellow (Fair)
+    { rssi: -65,  color: [0, 1, 0] },     // Green (Good)
+    { rssi: -55,  color: [0, 0, 1] }      // Blue (Excellent)
+  ];
+
+  // Clamp RSSI to range
+  if (rssi <= levels[0].rssi) return levels[0].color;
+  if (rssi >= levels[levels.length - 1].rssi) return levels[levels.length - 1].color;
+
+  // Find the segment rssi falls into
+  for (let i = 0; i < levels.length - 1; i++) {
+    const a = levels[i];
+    const b = levels[i + 1];
+    if (rssi >= a.rssi && rssi <= b.rssi) {
+      // Linear interpolation between colors
+      const t = (rssi - a.rssi) / (b.rssi - a.rssi);
+      const r = a.color[0] + t * (b.color[0] - a.color[0]);
+      const g = a.color[1] + t * (b.color[1] - a.color[1]);
+      const b_ = a.color[2] + t * (b.color[2] - a.color[2]);
+      return [r, g, b_];
+    }
   }
-  return [r,g,b];
 }
 
+
 function createTxViz(tx) {
-  // heading convention: 0 => +Y (up). direction vector = (sin(h), cos(h))
   const cx = centroid[0] || 0, cy = centroid[1] || 0;
   const group = new THREE.Group();
 
-  // small marker sphere at the TX location
   const sGeom = new THREE.SphereGeometry(1.2, 12, 8);
   const sMat = new THREE.MeshBasicMaterial({color: 0x00ff00});
   const s = new THREE.Mesh(sGeom, sMat);
   s.position.set(tx.x - cx, tx.y - cy, tx.h_m + 0.5);
   group.add(s);
 
-  // arrow at apex, pointing in heading direction
   const headingRad = (tx.heading_deg || 0) * Math.PI / 180.0;
   const dir = new THREE.Vector3(Math.sin(headingRad), Math.cos(headingRad), 0).normalize();
   const apexX = tx.x - cx;
@@ -1026,6 +1410,16 @@ async function init(){
   try{
     await loadAntennaConfigs();
 
+    // Check GPU status
+    const gpuStatus = await fetch('/gpu_status').then(r => r.json());
+    const statusEl = document.getElementById('gpuStatus');
+    statusEl.innerText = `(${gpuStatus.status})`;
+    if(gpuStatus.status.includes('GPU')) {
+      statusEl.className = 'status-good';
+    } else {
+      statusEl.className = 'status-warn';
+    }
+
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b0b0b);
     camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000000);
@@ -1042,7 +1436,6 @@ async function init(){
     bounds = [0,0,0,0,0,0];
     document.getElementById('ptcount').innerText = '0';
 
-    // heat points for simulation output
     heatPoints = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({size: 2, vertexColors:true}));
     scene.add(heatPoints);
 
@@ -1066,7 +1459,12 @@ async function init(){
     ws.onopen = ()=>console.log('WS open');
     ws.onmessage = (evt)=>{ try{ const m = JSON.parse(evt.data);
         if(m.type === 'clients') document.getElementById('clients').innerText = m.count;
-        else if(m.type === 'heatmap') renderHeatmap(m.grid);
+        else if(m.type === 'heatmap') {
+          renderHeatmap(m.grid);
+          if(m.simulation_method) {
+            document.getElementById('simStatus').innerHTML = `<span class="status-good">Complete (${m.simulation_method}, ${m.simulation_time?.toFixed(1)}s)</span>`;
+          }
+        }
         else if(m.type === 'sim_progress') updateSimProgress(m.percent);
     }catch(e){ showError('WS parse error: ' + e.message); } };
     ws.onclose = ()=>console.log('WS closed');
@@ -1081,7 +1479,6 @@ async function init(){
       const r = parseFloat(document.getElementById('utm_r').value || '100');
       try{
         document.getElementById('ptcount').innerText = 'loading...';
-        // Call load_bbox to prepare server KD-tree and return client sample metadata + cached sample points
         const res = await fetch('/load_bbox', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
@@ -1089,14 +1486,11 @@ async function init(){
         });
         if(!res.ok) throw new Error(`HTTP ${res.status}`);
         const info = await res.json();
-        // Start streaming the full-resolution NDJSON
         streamFullPointcloud();
-        // if server returned a quick client sample, render it immediately to give instant feedback
         if(info.client_points && Array.isArray(info.client_points) && info.client_points.length > 0){
           await updatePointCloudFromJSON({"points": info.client_points, "centroid": info.centroid, "bounds": info.bounds});
           document.getElementById('ptcount').innerText = info.client_sample_count || info.count || 'loaded';
         } else {
-          // leave existing points visible until streaming fills replacement
           document.getElementById('ptcount').innerText = info.count || 'loading';
         }
       }catch(err){
@@ -1160,7 +1554,6 @@ async function init(){
         antenna_spec = null;
       }
 
-      // Build TX object including antenna_spec (if any)
       const tx = {
         x: worldX, y: worldY, h_m: h, power_dbm: p, freq_hz: freq,
         ant_config: ant_config,
@@ -1197,7 +1590,7 @@ async function init(){
     document.getElementById('simulate').onclick = async ()=>{
       try{
         document.getElementById('simulate').disabled = true;
-        // show progress UI
+        document.getElementById('simStatus').innerHTML = '<span class="status-warn">Running...</span>';
         document.getElementById('progressBarContainer').style.display = 'block';
         document.getElementById('progressBar').style.width = '0%';
         const res = await fetch('/simulate', {method:'POST'});
@@ -1205,16 +1598,20 @@ async function init(){
           const txt = await res.text();
           showError('Simulate failed: ' + txt);
           document.getElementById('simulate').disabled = false;
+          document.getElementById('simStatus').innerText = 'Failed';
           return;
         }
         const payload = await res.json();
         if(payload && payload.grid) renderHeatmap(payload.grid);
+        if(payload.simulation_method) {
+          document.getElementById('simStatus').innerHTML = `<span class="status-good">Complete (${payload.simulation_method}, ${payload.simulation_time?.toFixed(1)}s)</span>`;
+        }
         document.getElementById('simulate').disabled = false;
-        // hide progress shortly after completion
         setTimeout(()=>{ document.getElementById('progressBarContainer').style.display = 'none'; }, 1200);
       }catch(err){
         showError('Simulate failed: ' + (err && err.message ? err.message : String(err)));
         document.getElementById('simulate').disabled = false;
+        document.getElementById('simStatus').innerText = 'Failed';
         document.getElementById('progressBarContainer').style.display = 'none';
       }
     };
@@ -1224,7 +1621,6 @@ async function init(){
   }
 }
 
-// Update or create point cloud from a JSON payload like /pointcloud (sampled)
 async function updatePointCloudFromJSON(json){
   try{
     if(!json || !Array.isArray(json.points)) throw new Error('Invalid /pointcloud response');
@@ -1257,7 +1653,6 @@ async function updatePointCloudFromJSON(json){
   }
 }
 
-// STREAM full-resolution NDJSON and update display progressively (no flash).
 async function streamFullPointcloud(){
   try{
     const resp = await fetch('/pointcloud_full');
@@ -1270,17 +1665,14 @@ async function streamFullPointcloud(){
     const decoder = new TextDecoder('utf-8');
     let { value: chunk, done: readerDone } = await reader.read();
     let buffer = '';
-    // We'll accumulate new points in arrays, and only replace the visible cloud once we have enough
     const newPositions = [];
     const newMeta = { count: 0, centroid: [0,0,0], bounds: [0,0,0,0,0,0] };
-    // create a temporary Points object but don't add it to the scene until it's sizeable
     let tempPoints = null;
     let tempMaterial = null;
-    // threshold: wait until we have at least 2000 points before swapping to avoid flashing
     const SWAP_THRESHOLD = 2000;
-    const FLUSH_CHUNK = 1000; // how many points to buffer between geometry updates
+    const FLUSH_CHUNK = 1000;
     let flushCounter = 0;
-    // streaming loop
+
     while(!readerDone){
       if(chunk){
         buffer += decoder.decode(chunk, {stream: true});
@@ -1297,13 +1689,10 @@ async function streamFullPointcloud(){
             continue;
           }
           if(obj._meta){
-            // final metadata (centroid/bounds/count)
             newMeta.count = obj._meta.count || newPositions.length;
             newMeta.centroid = obj._meta.centroid || newMeta.centroid;
             newMeta.bounds = obj._meta.bounds || newMeta.bounds;
-            // finished streaming - perform final swap if tempPoints exists
             if(tempPoints && newPositions.length > 0){
-              // finalize geometry
               const positions = new Float32Array(newPositions.length * 3);
               for(let i=0;i<newPositions.length;i++){
                 positions[i*3+0] = newPositions[i][0] - newMeta.centroid[0];
@@ -1312,7 +1701,6 @@ async function streamFullPointcloud(){
               }
               const geom = new THREE.BufferGeometry();
               geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-              // keep same size calculation as updatePointCloudFromJSON
               const spanX = newMeta.bounds[1] - newMeta.bounds[0];
               const spanY = newMeta.bounds[3] - newMeta.bounds[2];
               const spanZ = newMeta.bounds[5] - newMeta.bounds[4];
@@ -1320,7 +1708,6 @@ async function streamFullPointcloud(){
               const size = Math.max(0.6, span / 2000);
               const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
               const newPc = new THREE.Points(geom, mat);
-              // Add newPc and remove old pcPoints if present
               scene.add(newPc);
               if(pcPoints){
                 scene.remove(pcPoints);
@@ -1331,17 +1718,13 @@ async function streamFullPointcloud(){
               bounds = newMeta.bounds;
               document.getElementById('ptcount').innerText = newPositions.length;
             }
-            // done
             return;
           } else {
-            // regular point object
             if(typeof obj.x === 'number' && typeof obj.y === 'number' && typeof obj.z === 'number'){
               newPositions.push([obj.x, obj.y, obj.z]);
               flushCounter++;
             }
-            // If this is the first time we've accumulated enough points, create the tempPoints object
             if(tempPoints === null && newPositions.length >= Math.min(SWAP_THRESHOLD, FLUSH_CHUNK)){
-              // prepare partial geometry (we'll update it periodically)
               const initialCount = Math.min(newPositions.length, newPositions.length);
               const positions = new Float32Array(initialCount * 3);
               for(let i=0;i<initialCount;i++){
@@ -1353,19 +1736,14 @@ async function streamFullPointcloud(){
               geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
               tempMaterial = new THREE.PointsMaterial({size: 0.6, sizeAttenuation:true, color:0xcccccc});
               tempPoints = new THREE.Points(geom, tempMaterial);
-              // Do not remove old pcPoints yet — keep both visible to avoid flashing.
               scene.add(tempPoints);
-              // center adjustment will be applied on finalization; for now display relative positions anchored to previous centroid (may be slightly off)
             }
-            // periodically flush incremental updates to tempPoints to give visual feedback
             if(tempPoints && flushCounter >= FLUSH_CHUNK){
-              // expand tempPoints geometry to include newPoints
               const curLen = tempPoints.geometry.getAttribute('position').array.length / 3;
               const addLen = Math.max(0, newPositions.length - curLen);
               if(addLen > 0){
                 const newArr = new Float32Array((curLen + addLen) * 3);
                 newArr.set(tempPoints.geometry.getAttribute('position').array, 0);
-                // write added points
                 for(let i=0;i<addLen;i++){
                   const p = newPositions[curLen + i];
                   newArr[(curLen + i)*3 + 0] = p[0];
@@ -1376,11 +1754,8 @@ async function streamFullPointcloud(){
                 tempPoints.geometry.attributes.position.needsUpdate = true;
               }
               flushCounter = 0;
-              // if we've reached the SWAP_THRESHOLD, finalize swap
               if(newPositions.length >= SWAP_THRESHOLD){
-                // Build final geometry and swap
                 const positions = new Float32Array(newPositions.length * 3);
-                // center to centroid when meta is available; if not yet available, center to first-pass centroid
                 let cx = centroid[0] || 0;
                 let cy = centroid[1] || 0;
                 let cz = centroid[2] || 0;
@@ -1396,12 +1771,10 @@ async function streamFullPointcloud(){
                 const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
                 const newPc = new THREE.Points(geom, mat);
                 scene.add(newPc);
-                // remove old pcPoints
                 if(pcPoints){
                   scene.remove(pcPoints);
                   if(pcPoints.geometry) pcPoints.geometry.dispose();
                 }
-                // remove tempPoints
                 if(tempPoints){
                   scene.remove(tempPoints);
                   if(tempPoints.geometry) tempPoints.geometry.dispose();
@@ -1409,7 +1782,6 @@ async function streamFullPointcloud(){
                   tempMaterial = null;
                 }
                 pcPoints = newPc;
-                // update displayed count
                 document.getElementById('ptcount').innerText = newPositions.length;
               }
             }
@@ -1419,7 +1791,6 @@ async function streamFullPointcloud(){
       ({ value: chunk, done: readerDone } = await reader.read());
     }
 
-    // If we exit loop without meta, finalize best-effort
     if(newPositions.length > 0){
       const positions = new Float32Array(newPositions.length * 3);
       for(let i=0;i<newPositions.length;i++){
@@ -1492,17 +1863,46 @@ init();
 </script>
 </body>
 </html>
-"""  # end HTML_PAGE
+"""
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    """
+    Serve the main HTML page.
+    """
     return HTML_PAGE
+
+@app.get("/gpu_status")
+async def gpu_status():
+    """
+    Check and report GPU acceleration status.
+
+    global server_state
+    
+    Returns:
+    --------
+    JSONResponse: A JSON response indicating GPU status.
+    """
+    status = {
+        "cupy": HAS_CUPY,
+        "gpu_initialized": server_state.get("gpu_initialized", False)
+    }
+    
+    if HAS_CUPY:
+        status["status"] = "GPU Acceleration Available"
+    else:
+        status["status"] = "NO GPU!"
+    
+    return JSONResponse(status)
 
 @app.get("/pointcloud")
 async def pointcloud():
     """
-    Return current server_state point subset (centered for viewer) along with metadata.
-    This is a sampled client-friendly payload (fast). For full resolution stream, use /pointcloud_full.
+    Serve a sampled and centered point cloud for client visualization.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response containing centered point cloud data.
     """
     global server_state
     pts = server_state["pts"]
@@ -1511,7 +1911,6 @@ async def pointcloud():
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     cx = float(xs.mean()); cy = float(ys.mean()); cz = float(zs.mean())
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    # by default send at most 120k points as sample
     max_client = 120000
     if pts.shape[0] > max_client:
         idxs = np.linspace(0, pts.shape[0]-1, max_client, dtype=int)
@@ -1524,9 +1923,11 @@ async def pointcloud():
 @app.get("/pointcloud_full")
 async def pointcloud_full():
     """
-    Stream the full-resolution point cloud for the last loaded bbox as NDJSON.
-    Each line: {"x":..., "y":..., "z":...}
-    Final line: {"_meta": {"centroid": [...], "bounds":[minx,maxx,miny,maxy,minz,maxz], "count": N}}
+    Stream the full point cloud within the last loaded bounding box.
+
+    Returns:
+    --------
+    StreamingResponse: A streaming response yielding point cloud data in NDJSON format.
     """
     global server_state, DB_PATH
     bbox = server_state.get("last_bbox")
@@ -1535,11 +1936,14 @@ async def pointcloud_full():
     gen = stream_full_points_generator(DB_PATH, bbox)
     return StreamingResponse(gen, media_type="application/x-ndjson")
 
-# --- endpoints for antenna configs and reload ---
 @app.get("/antenna_configs")
 async def antenna_configs():
     """
-    Return a summary list of available antenna configs for the client UI.
+    List available antenna configurations with key specs.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response containing a list of antenna configurations.
     """
     global server_state
     out = []
@@ -1560,7 +1964,15 @@ async def antenna_configs():
 @app.get("/antenna_config/{name}")
 async def antenna_config(name: str):
     """
-    Return full antenna config dict for a given name (if exists).
+    Get full specification for a named antenna configuration.
+
+    Parameters:
+    -----------
+    name (str): The name of the antenna configuration.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response containing the antenna configuration specification.
     """
     global server_state
     spec = server_state.get("antenna_configs", {}).get(name)
@@ -1571,7 +1983,11 @@ async def antenna_config(name: str):
 @app.post("/reload_configs")
 async def reload_configs():
     """
-    Hot-reload configs/ JSON files into server_state (no restart required).
+    Reload antenna configurations from disk.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response indicating success and count of configurations.
     """
     global server_state
     try:
@@ -1584,9 +2000,15 @@ async def reload_configs():
 @app.post("/load_bbox")
 async def load_bbox(req: Request):
     """
-    Load subset of DB: JSON {cx, cy, r}
-    Rebuilds executor and KD-trees for workers.
-    Also stores last_bbox in server_state for the /pointcloud_full stream.
+    Load point cloud data within a specified bounding box and initialize GPU simulation.
+
+    Parameters:
+    -----------
+    req (Request): The incoming request containing JSON body with 'cx', 'cy', and 'r'.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response containing load information and client sample points.
     """
     global DB_PATH, server_state
     data = await req.json()
@@ -1601,11 +2023,16 @@ async def load_bbox(req: Request):
     print(f"[LOAD] loading bbox centered {cx},{cy} r={r} -> {minx},{miny} - {maxx},{maxy}")
     server_state["last_bbox"] = (minx, miny, maxx, maxy)
 
-    # Sampled load for server-side KD-tree build (fast)
+    # Sampled load for server-side KD-tree build.
     pts, meta = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy),
                                        max_points=None, max_server_points=1500000)
     if pts.shape[0] == 0:
         return JSONResponse({"count": 0, "message": "no points in area"}, status_code=200)
+    
+    # Initialize GPU simulation with the loaded points.
+    gpu_simulator.initialize(pts)
+    server_state["gpu_initialized"] = True
+    
     xy = pts[:, :2]
     try:
         kdtree = KDTree(xy)
@@ -1620,18 +2047,8 @@ async def load_bbox(req: Request):
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     centroid = [float(xs.mean()), float(ys.mean()), float(zs.mean())]
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    old_exec = server_state.get("executor")
-    if old_exec:
-        try:
-            old_exec.shutdown(wait=False)
-        except Exception:
-            pass
-    num_workers = server_state.get("num_workers", os.cpu_count() or 4)
-    executor = ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init, initargs=(pts,))
-    server_state["executor"] = executor
-    server_state["num_workers"] = num_workers
-    print(f"[LOAD] loaded {cnt} points; centroid={centroid}. Created executor with {num_workers} workers.")
-    # prepare a small client-friendly sample
+    
+    # Prepare client sample.
     client_pts, _ = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy), max_points=120000)
     if client_pts.shape[0] > 0:
         cx_c = float(client_pts[:,0].mean()); cy_c = float(client_pts[:,1].mean()); cz_c = float(client_pts[:,2].mean())
@@ -1639,11 +2056,23 @@ async def load_bbox(req: Request):
     else:
         centered_client = []
     server_state["client_sample"] = {"points": centered_client, "centroid": centroid, "bounds": bounds}
-    print(f"[LOAD] returning client sample {len(centered_client)} pts (client cap 120k)")
+    
+    print(f"[LOAD] GPU initialized with {cnt} points, KD-tree built, returning {len(centered_client)} client sample points")
     return JSONResponse({"count": cnt, "centroid": centroid, "bounds": bounds, "client_sample_count": len(centered_client), "client_points": centered_client})
 
 @app.post("/set_grid")
 async def set_grid(req: Request):
+    """
+    Set grid resolution and margin for simulations.
+
+    Parameters:
+    -----------
+    req (Request): The incoming request containing JSON body with 'grid_res' and 'grid_margin'.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response confirming the updated grid parameters.
+    """
     global server_state
     data = await req.json()
     try:
@@ -1662,8 +2091,15 @@ async def set_grid(req: Request):
 @app.post("/add_tx")
 async def add_tx(req: Request):
     """
-    Add transmitter. If the payload contains 'ant_config' matching a loaded config,
-    attach a copy of that spec as tx['antenna_spec'].
+    Add a transmitter with automatic ground elevation detection.
+
+    Parameters:
+    -----------
+    req (Request): The incoming request containing JSON body with transmitter parameters.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response indicating success or failure of adding the transmitter.
     """
     global server_state
     try:
@@ -1673,20 +2109,73 @@ async def add_tx(req: Request):
         print("[TX] add_tx: invalid json:", e)
         return JSONResponse({"error": msg}, status_code=400)
 
-    # Validate and coerce numeric fields
+    # Pull user-provided XY and requested height. (interpreted as AGL)
     try:
-        tx["x"] = float(tx.get("x"))
-        tx["y"] = float(tx.get("y"))
-        tx["h_m"] = float(tx.get("h_m", 2.0))
-        tx["power_dbm"] = float(tx.get("power_dbm", 20.0))
-        tx["freq_hz"] = float(tx.get("freq_hz", server_state.get("freq_hz", 2.4e9)))
-        tx["heading_deg"] = float(tx.get("heading_deg", 0.0))
+        tx_x = float(tx.get("x"))
+        tx_y = float(tx.get("y"))
     except Exception as e:
-        msg = f"Invalid transmitter parameter types: {e}"
-        print("[TX] bad param types:", e)
+        msg = f"Invalid TX X/Y: {e}"
+        print("[TX] bad coords:", e)
         return JSONResponse({"error": msg}, status_code=400)
 
-    # Attach antenna spec if provided (also accept full antenna_spec in payload)
+    # Default user-provided AGL (height field in UI) - treat this as height above ground.
+    try:
+        user_h_agl = float(tx.get("h_m", tx.get("height_agl", 2.0)))
+    except Exception:
+        user_h_agl = 2.0
+
+    # Find ground elevation at (tx_x, tx_y).
+    ground_z = 0.0
+    used_method = "none"
+    try:
+        pts = server_state.get("pts")
+        kdtree = server_state.get("kdtree")
+        # Prefer KD-tree on point cloud (kdtree was built on pts[:, :2]).
+        if kdtree is not None and pts is not None and pts.shape[0] > 0:
+            # Scipy cKDTree.query returns (dist, idx).
+            try:
+                d, idx = kdtree.query([tx_x, tx_y], k=1)
+                # idx may be array-like
+                if hasattr(idx, "__len__"):
+                    idx0 = int(idx[0])
+                else:
+                    idx0 = int(idx)
+                ground_z = float(pts[idx0, 2])
+                used_method = "kdtree_pointcloud"
+            except Exception:
+                # Some KDTree implementations expect shape (N,2) input; try alternative.
+                try:
+                    d, idx = kdtree.query(np.array([[tx_x, tx_y]]), k=1)
+                    idx0 = int(np.asarray(idx).ravel()[0])
+                    ground_z = float(pts[idx0, 2])
+                    used_method = "kdtree_pointcloud"
+                except Exception:
+                    used_method = "kdtree_failed"
+                    ground_z = 0.0
+    except Exception as e:
+        print("[TX] ground_z lookup exception:", e)
+        ground_z = 0.0
+        used_method = "exception"
+
+    # Compose final TX height = ground_z + user-provided AGL.
+    final_h = float(ground_z) + float(user_h_agl)
+
+    # Normalize and sanitize TX params.
+    try:
+        tx["x"] = float(tx_x)
+        tx["y"] = float(tx_y)
+        tx["h_m"] = float(final_h)           # Absolute elevation used by simulator.
+        tx["height_agl"] = float(user_h_agl) # User-specified AGL.
+        tx["ground_z"] = float(ground_z)     # Detected ground elevation at XY.
+        tx["power_dbm"] = float(tx.get("power_dbm", 20.0))
+        tx["freq_hz"] = float(tx.get("freq_hz", server_state.get("freq_hz", 2.4e9)))
+        tx["heading_deg"] = float(tx.get("heading_deg", tx.get("heading", 0.0) or 0.0))
+    except Exception as e:
+        msg = f"Invalid transmitter parameter types: {e}"
+        print("[TX] parameter conversion error:", e)
+        return JSONResponse({"error": msg}, status_code=400)
+
+    # Merge antenna config if present. (keeps previous behavior)
     ant_cfg_name = tx.get("ant_config")
     if ant_cfg_name:
         spec = server_state.get("antenna_configs", {}).get(ant_cfg_name)
@@ -1702,10 +2191,11 @@ async def add_tx(req: Request):
         if "antenna_spec" in tx:
             pass
 
+    # Save and print debug.
     try:
         server_state["txs"].append(tx)
-        print("[TX] added:", tx)
-        return JSONResponse({"ok": True, "total_txs": len(server_state["txs"])})
+        print(f"[TX] added: x={tx['x']:.2f} y={tx['y']:.2f} ground_z={ground_z:.3f} user_agl={user_h_agl:.3f} final_h={final_h:.3f} method={used_method}")
+        return JSONResponse({"ok": True, "total_txs": len(server_state["txs"]), "ground_z": ground_z, "final_h": final_h, "used_method": used_method})
     except Exception as exc:
         tb = traceback.format_exc()
         print("[TX] exception adding tx:", tb)
@@ -1713,6 +2203,13 @@ async def add_tx(req: Request):
 
 @app.post("/clear_txs")
 async def clear_txs():
+    """
+    Clear all defined transmitters.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response indicating success.
+    """
     server_state["txs"].clear()
     server_state["client_sample"] = None
     print("[TX] cleared")
@@ -1720,13 +2217,26 @@ async def clear_txs():
 
 @app.post("/simulate")
 async def simulate():
-    global server_state
+    """
+    Run the RF coverage simulation using GPU acceleration with occlusion.
+
+    Returns:
+    --------
+    JSONResponse: A JSON response containing the simulation results or error message.
+    """
+    global server_state, gpu_simulator
     pts = server_state["pts"]
+    kdtree = server_state.get("kdtree")
+    
     if pts is None or pts.shape[0] == 0:
-        return JSONResponse({"error": "no points loaded"}, status_code=400)
+        return JSONResponse({"error": "no points loaded - use 'Load area' first"}, status_code=400)
+    if kdtree is None:
+        return JSONResponse({"error": "KD-tree not built"}, status_code=400)
+        
     txs = server_state["txs"]
     if not txs:
-        return JSONResponse({"error": "no transmitters defined"}, status_code=400)
+        return JSONResponse({"error": "no transmitters defined - click 'Add transmitter' and place in scene"}, status_code=400)
+        
     if server_state["grid_x"] is None:
         xs = pts[:,0]; ys = pts[:,1]
         grid_margin_m = server_state.get("grid_margin", 40.0)
@@ -1737,43 +2247,64 @@ async def simulate():
         ny = max(8, int(math.ceil((maxy-miny)/grid_res_m)))
         server_state["grid_x"] = np.linspace(minx, maxx, nx)
         server_state["grid_y"] = np.linspace(miny, maxy, ny)
+    
     grid_x = server_state["grid_x"]
     grid_y = server_state["grid_y"]
+    freq_hz = server_state.get("freq_hz", 2.4e9)
 
-    # Always create a fresh executor for the simulation pass that initializes workers with the grid arrays.
-    num_workers = server_state.get("num_workers", os.cpu_count() or 4)
     start = time.time()
-    rss = None
+    print(f"[SIM] Starting simulation with {len(txs)} transmitters, grid {len(grid_x)}x{len(grid_y)}")
+    
     try:
-        # Convert grid to plain Python lists for stable pickling into initializer
-        grid_x_list = list(map(float, grid_x))
-        grid_y_list = list(map(float, grid_y))
-
-        with ProcessPoolExecutor(max_workers=num_workers,
-                                 initializer=_worker_init,
-                                 initargs=(pts, grid_x_list, grid_y_list)) as executor:
-            rss = compute_rssi_grid_parallel(txs, grid_x, grid_y, server_state.get("freq_hz", 2.4e9),
-                                             executor=executor, num_workers=num_workers,
-                                             tx_power_dbm=20.0, sample_step_m=3.0)
+        if HAS_CUPY:
+            method = "GPU" 
+        else:
+            raise RuntimeError("Cannot run GPU simulation without CuPy")
+        
+        rss = gpu_simulator.compute_coverage_gpu(txs, grid_x, grid_y, freq_hz, kdtree, pts)
     except Exception as e:
-        tb = traceback.format_exc()
-        print("[SIM] simulation exception:", tb)
-        return JSONResponse({"error": "simulation failed", "detail": str(e)}, status_code=500)
+        print(f"[SIM] Simulation failed: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": f"Simulation failed: {str(e)}"}, status_code=500)
 
     elapsed = time.time() - start
-    print(f"[SIM] compute finished in {elapsed:.2f}s")
+    print(f"[SIM] {method} compute with occlusion finished in {elapsed:.2f}s")
+    
     if rss is None:
         return JSONResponse({"error": "simulation produced no result"}, status_code=500)
+        
     rssi_flat = [float(x) for x in rss.ravel().tolist()]
-    payload = {"type":"heatmap", "grid": {"xs": [float(x) for x in grid_x], "ys": [float(y) for y in grid_y], "rssi": rssi_flat}}
+    payload = {
+        "type": "heatmap", 
+        "grid": {
+            "xs": [float(x) for x in grid_x], 
+            "ys": [float(y) for y in grid_y], 
+            "rssi": rssi_flat
+        },
+        "simulation_method": method + " with Occlusion",
+        "simulation_time": elapsed
+    }
+    
     try:
         await broadcast_message(json.dumps(payload))
     except Exception as e:
         print("[SIM] broadcast error:", e)
+        
     return JSONResponse(payload)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time client updates.
+    
+    Parameters:
+    -----------
+    websocket (WebSocket): The WebSocket connection instance.
+    
+    Returns:
+    --------
+    None
+    """
     await websocket.accept()
     connected_websockets.append(websocket)
     try:
@@ -1786,10 +2317,28 @@ async def websocket_endpoint(websocket: WebSocket):
         await broadcast_clients_count()
 
 async def broadcast_clients_count():
+    """
+    Broadcast the current count of connected WebSocket clients.
+
+    Returns:
+    --------
+    None
+    """
     msg = json.dumps({"type":"clients", "count": len(connected_websockets)})
     await broadcast_message(msg)
 
 async def broadcast_message(msg: str):
+    """
+    Broadcast a message to all connected WebSocket clients.
+
+    Parameters:
+    -----------
+    msg (str): The message to broadcast.
+
+    Returns:
+    --------
+    None
+    """
     living = []
     for ws in list(connected_websockets):
         try:
@@ -1816,9 +2365,10 @@ server_state = {
     "freq_hz": 2.4e9,
     "executor": None,
     "num_workers": (os.cpu_count() or 4),
-    "antenna_configs": {},   # filled at startup
+    "antenna_configs": {},
     "client_sample": None,
-    "last_bbox": None
+    "last_bbox": None,
+    "gpu_initialized": False
 }
 
 # ------------------------
@@ -1826,7 +2376,7 @@ server_state = {
 # ------------------------
 def main():
     global DB_PATH, server_state
-    parser = argparse.ArgumentParser(description="Run LiDAR RF on-demand simulator + viewer")
+    parser = argparse.ArgumentParser(description="Run LiDAR RF on-demand simulator + viewer with FIXED GPU acceleration and occlusion")
     parser.add_argument("db", help="Path to SQLite DB created by lidar_preprocess.py")
     parser.add_argument("--workers", type=int, default=(os.cpu_count() or 4), help="Number of worker processes for simulation")
     parser.add_argument("--host", default="0.0.0.0")
@@ -1835,22 +2385,15 @@ def main():
     DB_PATH = args.db
     server_state["num_workers"] = max(1, int(args.workers))
     server_state["pts"] = np.zeros((0,3))
-    server_state["kdtree"] = None
-    server_state["grid_x"] = None
-    server_state["grid_y"] = None
-    server_state["txs"] = []
-    server_state["executor"] = None
-    server_state["client_sample"] = None
-    server_state["last_bbox"] = None
 
-    # Load antenna configs at startup
+    # Load antenna configs at startup.
     try:
         server_state["antenna_configs"] = load_antenna_configs()
     except Exception as e:
         print("[CONFIG] failed to load antenna configs:", e)
         server_state["antenna_configs"] = {}
 
-    print("Server starting WITHOUT loading points. Use the web UI 'Load area' to populate a subset (then stream full resolution).")
+    print("Use the web UI 'Load area' to populate a subset and initialize GPU simulation")
     print(f"Starting server at http://{args.host}:{args.port} ...")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
