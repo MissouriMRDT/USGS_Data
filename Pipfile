@@ -26,6 +26,3 @@ embreex = "*"
 cupy-cuda12x = "*"
 
 [dev-packages]
-
-[requires]
-python_version = "3.12"

@@ -1134,8 +1134,8 @@ HTML_PAGE = r"""
   <div><b>LiDAR RF Viewer</b> <span id="gpuStatus">(Checking GPU...)</span></div>
 
   <div style="margin-top:8px;">
-    <label>UTM Easting</label><input id="utm_e" type="number" step="0.01" value="0"/><br/>
-    <label>UTM Northing</label><input id="utm_n" type="number" step="0.01" value="0"/><br/>
+    <label>UTM Easting</label><input id="utm_e" type="number" step="0.01" value="606853.65"/><br/>
+    <label>UTM Northing</label><input id="utm_n" type="number" step="0.01" value="4200936.40"/><br/>
     <label>Radius (m)</label><input id="utm_r" type="number" step="1" value="100"/><br/>
     <div style="margin-top:6px;">
       <button id="loadArea">Load area (stream full res)</button>
@@ -1146,9 +1146,9 @@ HTML_PAGE = r"""
   <hr/>
 
   <div>
-    <label>Grid resolution (m)</label><input id="grid_res" type="number" step="0.1" value="6.0"/>
+    <label>Grid resolution (m)</label><input id="grid_res" type="number" step="0.1" value="2.0"/>
     <br/>
-    <label>Grid margin (m)</label><input id="grid_margin" type="number" step="1" value="40.0"/>
+    <label>Grid margin (m)</label><input id="grid_margin" type="number" step="1" value="20.0"/>
     <div style="margin-top:6px;">
       <button id="setGrid">Set grid</button>
     </div>
@@ -1499,8 +1499,8 @@ async function init(){
     };
 
     document.getElementById('setGrid').onclick = async ()=>{
-      const gr = parseFloat(document.getElementById('grid_res').value || '6.0');
-      const gm = parseFloat(document.getElementById('grid_margin').value || '40.0');
+      const gr = parseFloat(document.getElementById('grid_res').value || '2.0');
+      const gm = parseFloat(document.getElementById('grid_margin').value || '20.0');
       try{
         const res = await fetch('/set_grid', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({grid_res:gr, grid_margin:gm})});
         if(!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2076,8 +2076,8 @@ async def set_grid(req: Request):
     global server_state
     data = await req.json()
     try:
-        gr = float(data.get("grid_res", server_state.get("grid_res", 6.0)))
-        gm = float(data.get("grid_margin", server_state.get("grid_margin", 40.0)))
+        gr = float(data.get("grid_res", server_state.get("grid_res", 2.0)))
+        gm = float(data.get("grid_margin", server_state.get("grid_margin", 20.0)))
     except Exception:
         return JSONResponse({"error":"invalid parameters"}, status_code=400)
     server_state["grid_res"] = gr
@@ -2239,8 +2239,8 @@ async def simulate():
         
     if server_state["grid_x"] is None:
         xs = pts[:,0]; ys = pts[:,1]
-        grid_margin_m = server_state.get("grid_margin", 40.0)
-        grid_res_m = server_state.get("grid_res", 6.0)
+        grid_margin_m = server_state.get("grid_margin", 20.0)
+        grid_res_m = server_state.get("grid_res", 2.0)
         minx, maxx = float(xs.min()-grid_margin_m), float(xs.max()+grid_margin_m)
         miny, maxy = float(ys.min()-grid_margin_m), float(ys.max()+grid_margin_m)
         nx = max(8, int(math.ceil((maxx-minx)/grid_res_m)))
@@ -2360,8 +2360,8 @@ server_state = {
     "txs": [],
     "grid_x": None,
     "grid_y": None,
-    "grid_res": 6.0,
-    "grid_margin": 40.0,
+    "grid_res": 2.0,
+    "grid_margin": 20.0,
     "freq_hz": 2.4e9,
     "executor": None,
     "num_workers": (os.cpu_count() or 4),
