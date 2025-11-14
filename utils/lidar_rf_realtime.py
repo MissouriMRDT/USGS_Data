@@ -1383,20 +1383,21 @@ function rssi_to_rgb(rssi) {
 
 
 function createTxViz(tx) {
-  const cx = centroid[0] || 0, cy = centroid[1] || 0;
+  const cx = centroid[0] || 0, cy = centroid[1] || 0, cz = centroid[2] || 0;
   const group = new THREE.Group();
 
   const sGeom = new THREE.SphereGeometry(1.2, 12, 8);
   const sMat = new THREE.MeshBasicMaterial({color: 0x00ff00});
   const s = new THREE.Mesh(sGeom, sMat);
-  s.position.set(tx.x - cx, tx.y - cy, tx.h_m + 0.5);
+  // Viewer Z coordinates are point-cloud-relative, so subtract centroid Z from absolute tx.h_m
+  s.position.set(tx.x - cx, tx.y - cy, (tx.h_m - cz) + 0.5);
   group.add(s);
 
   const headingRad = (tx.heading_deg || 0) * Math.PI / 180.0;
   const dir = new THREE.Vector3(Math.sin(headingRad), Math.cos(headingRad), 0).normalize();
   const apexX = tx.x - cx;
   const apexY = tx.y - cy;
-  const apexZ = tx.h_m + 0.5;
+  const apexZ = (tx.h_m - cz) + 0.5;
   const origin = new THREE.Vector3(apexX, apexY, apexZ);
   const arrowLen = 40;
   const arrow = new THREE.ArrowHelper(dir, origin, Math.min(arrowLen, 80), 0xff0000, 4, 2);
@@ -1577,6 +1578,11 @@ async function init(){
           console.error('Add TX failed', res.status, text);
         } else {
           console.log('Add TX response:', parsed || text);
+          // Use server-returned final_h (absolute elevation) for the visual so it matches the simulator.
+          if(parsed && parsed.final_h !== undefined){
+            tx.h_m = parseFloat(parsed.final_h);
+            if(parsed.ground_z !== undefined) tx.ground_z = parseFloat(parsed.ground_z);
+          }
           const vis = createTxViz(tx);
           scene.add(vis);
           txVisuals.push(vis);
