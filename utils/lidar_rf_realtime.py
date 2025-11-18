@@ -939,7 +939,7 @@ class GPURFSimulator:
 def load_pointcloud_from_db(db_path: str,
                            bbox: Optional[Tuple[float,float,float,float]] = None,
                            max_points: Optional[int] = None,
-                           max_server_points: int = 1500000) -> Tuple[np.ndarray, List[Dict]]:
+                           max_server_points: int = 999999999) -> Tuple[np.ndarray, List[Dict]]:
     """
     Load and optionally sample point cloud from SQLite database within a bounding box.
 
@@ -1134,8 +1134,8 @@ HTML_PAGE = r"""
   <div><b>LiDAR RF Viewer</b> <span id="gpuStatus">(Checking GPU...)</span></div>
 
   <div style="margin-top:8px;">
-    <label>UTM Easting</label><input id="utm_e" type="number" step="0.01" value="606853.65"/><br/>
-    <label>UTM Northing</label><input id="utm_n" type="number" step="0.01" value="4200936.40"/><br/>
+    <label>UTM Easting</label><input id="utm_e" type="number" step="0.01" value="518850.47"/><br/>
+    <label>UTM Northing</label><input id="utm_n" type="number" step="0.01" value="4252342.10"/><br/>
     <label>Radius (m)</label><input id="utm_r" type="number" step="1" value="100"/><br/>
     <div style="margin-top:6px;">
       <button id="loadArea">Load area (stream full res)</button>
@@ -1169,9 +1169,9 @@ HTML_PAGE = r"""
       <div class="config-row"><label for="txp">TX Power (dBm)</label><input id="txp" type="number" step="0.1" value="20"/></div>
       <div class="config-row"><label for="freq">Frequency</label>
         <select id="freq" style="width:220px;">
-          <option value="900e6">900 MHz</option>
           <option value="2.4e9">2.4 GHz</option>
           <option value="5.8e9">5.8 GHz</option>
+          <option value="900e6">900 MHz</option>
         </select>
       </div>
       <div class="config-row"><label for="txh">TX Height (m)</label><input id="txh" type="number" step="0.1" value="2"/></div>
@@ -1381,6 +1381,60 @@ function rssi_to_rgb(rssi) {
   }
 }
 
+let pointCloudIndex = null; // Simple grid-based spatial index
+
+function buildPointCloudIndex() {
+  if (!pointCloud || pointCloud.length === 0) return;
+  const cellSize = 5.0; // 5m grid cells for indexing
+  pointCloudIndex = {};
+  for (const pt of pointCloud) {
+    const key = `${Math.floor(pt.x / cellSize)},${Math.floor(pt.y / cellSize)}`;
+    if (!pointCloudIndex[key]) pointCloudIndex[key] = [];
+    pointCloudIndex[key].push(pt);
+  }
+}
+
+function getTerrainZAtXY(x, y) {
+  if (!pointCloud || pointCloud.length === 0) return 0.15;
+  
+  // Convert incoming absolute world coords into the point-cloud-relative coords
+  // (pointCloud entries are stored relative to centroid).
+  const qx = x - (centroid[0] || 0);
+  const qy = y - (centroid[1] || 0);
+  
+  // Use index if available, otherwise fallback to brute force
+  if (pointCloudIndex) {
+    const cellSize = 5.0;
+    const searchRadius = 2; // Check neighboring cells
+    let minDist = Infinity;
+    let bestZ = 0.15;
+    
+    for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+      for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+        const key = `${Math.floor(qx / cellSize) + dx},${Math.floor(qy / cellSize) + dy}`;
+        const cell = pointCloudIndex[key];
+        if (!cell) continue;
+        
+        for (const pt of cell) {
+          const dist = Math.hypot(pt.x - qx, pt.y - qy);
+          if (dist < minDist) {
+            minDist = dist;
+            bestZ = pt.z;
+          }
+        }
+      }
+    }
+    return bestZ;
+  }
+  
+  // Fallback brute force (slow)
+  let minDist = Infinity, z = 0.15;
+  for (const pt of pointCloud) {
+    const dist = Math.hypot(pt.x - qx, pt.y - qy);
+    if (dist < minDist) { minDist = dist; z = pt.z; }
+  }
+  return z;
+}
 
 function createTxViz(tx) {
   const cx = centroid[0] || 0, cy = centroid[1] || 0, cz = centroid[2] || 0;
@@ -1631,6 +1685,7 @@ async function updatePointCloudFromJSON(json){
   try{
     if(!json || !Array.isArray(json.points)) throw new Error('Invalid /pointcloud response');
     pointCloud = json.points;
+    buildPointCloudIndex();
     centroid = json.centroid || [0,0,0];
     bounds = json.bounds || [0,0,0,0,0,0];
     const positions = new Float32Array(pointCloud.length * 3);
@@ -1722,6 +1777,7 @@ async function streamFullPointcloud(){
               pcPoints = newPc;
               centroid = newMeta.centroid;
               bounds = newMeta.bounds;
+              buildPointCloudIndex();
               document.getElementById('ptcount').innerText = newPositions.length;
             }
             return;
@@ -1844,7 +1900,8 @@ function renderHeatmap(grid){
       for(let i=0;i<nx;i++){
         const x = xs[i] - (centroid[0] || 0);
         const y = ys[j] - (centroid[1] || 0);
-        pos[k*3+0]=x; pos[k*3+1]=y; pos[k*3+2]=0.15;
+        const z = getTerrainZAtXY(xs[i], ys[j]);
+        pos[k*3+0]=x; pos[k*3+1]=y; pos[k*3+2]=z;
         const v = rssi[j*nx + i];
         const rgb = rssi_to_rgb(v);
         col[k*3+0]=rgb[0]; col[k*3+1]=rgb[1]; col[k*3+2]=rgb[2];
@@ -1917,12 +1974,7 @@ async def pointcloud():
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     cx = float(xs.mean()); cy = float(ys.mean()); cz = float(zs.mean())
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    max_client = 120000
-    if pts.shape[0] > max_client:
-        idxs = np.linspace(0, pts.shape[0]-1, max_client, dtype=int)
-        sample = pts[idxs]
-    else:
-        sample = pts
+    sample = pts
     centered = [{"x": float(x - cx), "y": float(y - cy), "z": float(z - cz)} for (x, y, z) in sample]
     return JSONResponse({"points": centered, "centroid": [cx, cy, cz], "bounds": bounds})
 
@@ -2030,8 +2082,7 @@ async def load_bbox(req: Request):
     server_state["last_bbox"] = (minx, miny, maxx, maxy)
 
     # Sampled load for server-side KD-tree build.
-    pts, meta = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy),
-                                       max_points=None, max_server_points=1500000)
+    pts, meta = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy))
     if pts.shape[0] == 0:
         return JSONResponse({"count": 0, "message": "no points in area"}, status_code=200)
     
@@ -2055,9 +2106,11 @@ async def load_bbox(req: Request):
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
     
     # Prepare client sample.
-    client_pts, _ = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy), max_points=120000)
+    client_pts, _ = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy))
     if client_pts.shape[0] > 0:
-        cx_c = float(client_pts[:,0].mean()); cy_c = float(client_pts[:,1].mean()); cz_c = float(client_pts[:,2].mean())
+        # Center client sample using the same centroid we return to the client so coordinates
+        # are consistent with the 'centroid' field (client-side JS expects points relative to centroid).
+        cx_c, cy_c, cz_c = centroid[0], centroid[1], centroid[2]
         centered_client = [{"x": float(x - cx_c), "y": float(y - cy_c), "z": float(z - cz_c)} for (x,y,z) in client_pts]
     else:
         centered_client = []
