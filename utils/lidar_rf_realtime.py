@@ -997,7 +997,7 @@ def load_pointcloud_from_db(db_path: str,
     sampled_pts = []
     sampled_meta = []
     total_seen = 0
-    fetch_size = 10000
+    fetch_size = 100000
 
     while True:
         rows = c.fetchmany(fetch_size)
@@ -1028,7 +1028,7 @@ def load_pointcloud_from_db(db_path: str,
 # ------------------------
 # Full-resolution stream endpoint generator (NDJSON) - preserved
 # ------------------------
-def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,float], fetch_size: int = 10000):
+def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,float], fetch_size: int = 100000):
     """
     Generator that streams full-resolution LiDAR points from the database within a bounding box as NDJSON.
 
@@ -1090,7 +1090,7 @@ def stream_full_points_generator(db_path: str, bbox: Tuple[float,float,float,flo
     conn.close()
 
 # ------------------------
-# FastAPI app + websockets (ORIGINAL GUI FULLY PRESERVED)
+# FastAPI app + websockets
 # ------------------------
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
@@ -1542,12 +1542,6 @@ async function init(){
         if(!res.ok) throw new Error(`HTTP ${res.status}`);
         const info = await res.json();
         streamFullPointcloud();
-        if(info.client_points && Array.isArray(info.client_points) && info.client_points.length > 0){
-          await updatePointCloudFromJSON({"points": info.client_points, "centroid": info.centroid, "bounds": info.bounds});
-          document.getElementById('ptcount').innerText = info.client_sample_count || info.count || 'loaded';
-        } else {
-          document.getElementById('ptcount').innerText = info.count || 'loading';
-        }
       }catch(err){
         showError('Load area failed: ' + (err && err.message ? err.message : String(err)));
       }
@@ -1726,13 +1720,10 @@ async function streamFullPointcloud(){
     const decoder = new TextDecoder('utf-8');
     let { value: chunk, done: readerDone } = await reader.read();
     let buffer = '';
-    const newPositions = [];
-    const newMeta = { count: 0, centroid: [0,0,0], bounds: [0,0,0,0,0,0] };
-    let tempPoints = null;
-    let tempMaterial = null;
-    const SWAP_THRESHOLD = 2000;
-    const FLUSH_CHUNK = 1000;
-    let flushCounter = 0;
+    
+    // Accumulate all points here
+    const allPoints = [];
+    let newMeta = { count: 0, centroid: [0,0,0], bounds: [0,0,0,0,0,0] };
 
     while(!readerDone){
       if(chunk){
@@ -1750,102 +1741,13 @@ async function streamFullPointcloud(){
             continue;
           }
           if(obj._meta){
-            newMeta.count = obj._meta.count || newPositions.length;
+            newMeta.count = obj._meta.count;
             newMeta.centroid = obj._meta.centroid || newMeta.centroid;
             newMeta.bounds = obj._meta.bounds || newMeta.bounds;
-            if(tempPoints && newPositions.length > 0){
-              const positions = new Float32Array(newPositions.length * 3);
-              for(let i=0;i<newPositions.length;i++){
-                positions[i*3+0] = newPositions[i][0] - newMeta.centroid[0];
-                positions[i*3+1] = newPositions[i][1] - newMeta.centroid[1];
-                positions[i*3+2] = newPositions[i][2] - newMeta.centroid[2];
-              }
-              const geom = new THREE.BufferGeometry();
-              geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-              const spanX = newMeta.bounds[1] - newMeta.bounds[0];
-              const spanY = newMeta.bounds[3] - newMeta.bounds[2];
-              const spanZ = newMeta.bounds[5] - newMeta.bounds[4];
-              const span = Math.max(1, spanX, spanY, spanZ);
-              const size = Math.max(0.6, span / 2000);
-              const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
-              const newPc = new THREE.Points(geom, mat);
-              scene.add(newPc);
-              if(pcPoints){
-                scene.remove(pcPoints);
-                if(pcPoints.geometry) pcPoints.geometry.dispose();
-              }
-              pcPoints = newPc;
-              centroid = newMeta.centroid;
-              bounds = newMeta.bounds;
-              buildPointCloudIndex();
-              document.getElementById('ptcount').innerText = newPositions.length;
-            }
-            return;
           } else {
             if(typeof obj.x === 'number' && typeof obj.y === 'number' && typeof obj.z === 'number'){
-              newPositions.push([obj.x, obj.y, obj.z]);
-              flushCounter++;
-            }
-            if(tempPoints === null && newPositions.length >= Math.min(SWAP_THRESHOLD, FLUSH_CHUNK)){
-              const initialCount = Math.min(newPositions.length, newPositions.length);
-              const positions = new Float32Array(initialCount * 3);
-              for(let i=0;i<initialCount;i++){
-                positions[i*3+0] = newPositions[i][0];
-                positions[i*3+1] = newPositions[i][1];
-                positions[i*3+2] = newPositions[i][2];
-              }
-              const geom = new THREE.BufferGeometry();
-              geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-              tempMaterial = new THREE.PointsMaterial({size: 0.6, sizeAttenuation:true, color:0xcccccc});
-              tempPoints = new THREE.Points(geom, tempMaterial);
-              scene.add(tempPoints);
-            }
-            if(tempPoints && flushCounter >= FLUSH_CHUNK){
-              const curLen = tempPoints.geometry.getAttribute('position').array.length / 3;
-              const addLen = Math.max(0, newPositions.length - curLen);
-              if(addLen > 0){
-                const newArr = new Float32Array((curLen + addLen) * 3);
-                newArr.set(tempPoints.geometry.getAttribute('position').array, 0);
-                for(let i=0;i<addLen;i++){
-                  const p = newPositions[curLen + i];
-                  newArr[(curLen + i)*3 + 0] = p[0];
-                  newArr[(curLen + i)*3 + 1] = p[1];
-                  newArr[(curLen + i)*3 + 2] = p[2];
-                }
-                tempPoints.geometry.setAttribute('position', new THREE.BufferAttribute(newArr, 3));
-                tempPoints.geometry.attributes.position.needsUpdate = true;
-              }
-              flushCounter = 0;
-              if(newPositions.length >= SWAP_THRESHOLD){
-                const positions = new Float32Array(newPositions.length * 3);
-                let cx = centroid[0] || 0;
-                let cy = centroid[1] || 0;
-                let cz = centroid[2] || 0;
-                for(let i=0;i<newPositions.length;i++){
-                  positions[i*3+0] = newPositions[i][0] - cx;
-                  positions[i*3+1] = newPositions[i][1] - cy;
-                  positions[i*3+2] = newPositions[i][2] - cz;
-                }
-                const geom = new THREE.BufferGeometry();
-                geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                const span = 1;
-                const size = Math.max(0.6, span / 2000);
-                const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
-                const newPc = new THREE.Points(geom, mat);
-                scene.add(newPc);
-                if(pcPoints){
-                  scene.remove(pcPoints);
-                  if(pcPoints.geometry) pcPoints.geometry.dispose();
-                }
-                if(tempPoints){
-                  scene.remove(tempPoints);
-                  if(tempPoints.geometry) tempPoints.geometry.dispose();
-                  tempPoints = null;
-                  tempMaterial = null;
-                }
-                pcPoints = newPc;
-                document.getElementById('ptcount').innerText = newPositions.length;
-              }
+              // Store raw coordinates [x, y, z]
+              allPoints.push([obj.x, obj.y, obj.z]);
             }
           }
         }
@@ -1853,24 +1755,49 @@ async function streamFullPointcloud(){
       ({ value: chunk, done: readerDone } = await reader.read());
     }
 
-    if(newPositions.length > 0){
-      const positions = new Float32Array(newPositions.length * 3);
-      for(let i=0;i<newPositions.length;i++){
-        positions[i*3+0] = newPositions[i][0] - (centroid[0] || 0);
-        positions[i*3+1] = newPositions[i][1] - (centroid[1] || 0);
-        positions[i*3+2] = newPositions[i][2] - (centroid[2] || 0);
+    // Finished downloading - now render once
+    if(allPoints.length > 0){
+      const positions = new Float32Array(allPoints.length * 3);
+      
+      // Use centroid from meta if available, else calculate crude mean
+      const cx = newMeta.centroid[0] || 0;
+      const cy = newMeta.centroid[1] || 0;
+      const cz = newMeta.centroid[2] || 0;
+
+      // Flatten and center
+      for(let i=0; i < allPoints.length; i++){
+        positions[i*3+0] = allPoints[i][0] - cx;
+        positions[i*3+1] = allPoints[i][1] - cy;
+        positions[i*3+2] = allPoints[i][2] - cz;
       }
+
       const geom = new THREE.BufferGeometry();
       geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      const mat = new THREE.PointsMaterial({size:0.6, sizeAttenuation:true, color:0xffffff});
+      
+      const spanX = newMeta.bounds[1] - newMeta.bounds[0];
+      const spanY = newMeta.bounds[3] - newMeta.bounds[2];
+      const spanZ = newMeta.bounds[5] - newMeta.bounds[4];
+      const span = Math.max(1, spanX, spanY, spanZ);
+      const size = Math.max(0.6, span / 2000);
+      const mat = new THREE.PointsMaterial({size:size, sizeAttenuation:true, color:0xffffff});
       const newPc = new THREE.Points(geom, mat);
+      
       scene.add(newPc);
+      
+      // Cleanup old
       if(pcPoints){
         scene.remove(pcPoints);
         if(pcPoints.geometry) pcPoints.geometry.dispose();
       }
       pcPoints = newPc;
-      document.getElementById('ptcount').innerText = newPositions.length;
+      centroid = newMeta.centroid;
+      bounds = newMeta.bounds;
+      
+      // Rebuild local index for height lookup
+      pointCloud = allPoints.map(p => ({x: p[0], y: p[1], z: p[2]}));
+      buildPointCloudIndex();
+      
+      document.getElementById('ptcount').innerText = allPoints.length;
     }
 
   }catch(e){
@@ -1958,26 +1885,6 @@ async def gpu_status():
     
     return JSONResponse(status)
 
-@app.get("/pointcloud")
-async def pointcloud():
-    """
-    Serve a sampled and centered point cloud for client visualization.
-
-    Returns:
-    --------
-    JSONResponse: A JSON response containing centered point cloud data.
-    """
-    global server_state
-    pts = server_state["pts"]
-    if pts is None or pts.shape[0] == 0:
-        return JSONResponse({"points": [], "centroid": [0,0,0], "bounds": [0,0,0,0,0,0]})
-    xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
-    cx = float(xs.mean()); cy = float(ys.mean()); cz = float(zs.mean())
-    bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
-    sample = pts
-    centered = [{"x": float(x - cx), "y": float(y - cy), "z": float(z - cz)} for (x, y, z) in sample]
-    return JSONResponse({"points": centered, "centroid": [cx, cy, cz], "bounds": bounds})
-
 @app.get("/pointcloud_full")
 async def pointcloud_full():
     """
@@ -2050,7 +1957,6 @@ async def reload_configs():
     global server_state
     try:
         server_state["antenna_configs"] = load_antenna_configs()
-        server_state["client_sample"] = None
         return JSONResponse({"ok": True, "count": len(server_state["antenna_configs"])})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -2099,25 +2005,14 @@ async def load_bbox(req: Request):
     server_state["kdtree"] = kdtree
     server_state["grid_x"] = None
     server_state["grid_y"] = None
-    server_state["client_sample"] = None
     cnt = pts.shape[0]
     xs = pts[:,0]; ys = pts[:,1]; zs = pts[:,2]
     centroid = [float(xs.mean()), float(ys.mean()), float(zs.mean())]
     bounds = [float(xs.min()), float(xs.max()), float(ys.min()), float(ys.max()), float(zs.min()), float(zs.max())]
     
     # Prepare client sample.
-    client_pts, _ = load_pointcloud_from_db(DB_PATH, bbox=(minx, miny, maxx, maxy))
-    if client_pts.shape[0] > 0:
-        # Center client sample using the same centroid we return to the client so coordinates
-        # are consistent with the 'centroid' field (client-side JS expects points relative to centroid).
-        cx_c, cy_c, cz_c = centroid[0], centroid[1], centroid[2]
-        centered_client = [{"x": float(x - cx_c), "y": float(y - cy_c), "z": float(z - cz_c)} for (x,y,z) in client_pts]
-    else:
-        centered_client = []
-    server_state["client_sample"] = {"points": centered_client, "centroid": centroid, "bounds": bounds}
-    
-    print(f"[LOAD] GPU initialized with {cnt} points, KD-tree built, returning {len(centered_client)} client sample points")
-    return JSONResponse({"count": cnt, "centroid": centroid, "bounds": bounds, "client_sample_count": len(centered_client), "client_points": centered_client})
+    print(f"[LOAD] GPU initialized with {cnt} points and KD-tree built")
+    return JSONResponse({"count": cnt, "centroid": centroid, "bounds": bounds})
 
 @app.post("/set_grid")
 async def set_grid(req: Request):
@@ -2143,7 +2038,6 @@ async def set_grid(req: Request):
     server_state["grid_margin"] = gm
     server_state["grid_x"] = None
     server_state["grid_y"] = None
-    server_state["client_sample"] = None
     print(f"[GRID] updated grid_res={gr} grid_margin={gm}")
     return JSONResponse({"grid_res": gr, "grid_margin": gm})
 
@@ -2270,7 +2164,6 @@ async def clear_txs():
     JSONResponse: A JSON response indicating success.
     """
     server_state["txs"].clear()
-    server_state["client_sample"] = None
     print("[TX] cleared")
     return JSONResponse({"ok": True})
 
@@ -2425,7 +2318,6 @@ server_state = {
     "executor": None,
     "num_workers": (os.cpu_count() or 4),
     "antenna_configs": {},
-    "client_sample": None,
     "last_bbox": None,
     "gpu_initialized": False
 }
