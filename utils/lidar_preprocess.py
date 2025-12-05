@@ -104,8 +104,8 @@ def create_db(db_path):
     - easting        REAL: X-coordinate in UTM
     - northing       REAL: Y-coordinate in UTM
     - altitude       REAL: Elevation in meters
-    - zone           TEXT: UTM zone identifier (e.g., "12N")
-    - classification TEXT: Interpreted class label of the point (e.g., "Ground", "Vegetation")
+    - zone_id        INTEGER: Foreign key to Zones table
+    - class_code     INTEGER: Raw LAS classification code
 
     Precomputed Metric Fields:
     --------------------------
@@ -136,23 +136,43 @@ def create_db(db_path):
     c.execute("PRAGMA journal_mode = WAL;")
     c.execute("PRAGMA synchronous = NORMAL;")
 
+    # Create lookup tables for normalization to save space
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS Zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT UNIQUE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS Classifications (
+            code INTEGER PRIMARY KEY,
+            label TEXT
+        )
+    """)
+
+    # Populate Classifications table
+    c.executemany("INSERT OR IGNORE INTO Classifications (code, label) VALUES (?, ?)", 
+                  CLASSIFICATION_MAP.items())
+
     # Create the table to store processed LiDAR points and computed metrics.
+    # OPTIMIZATION: Swapped text columns 'zone' and 'classification' for integer IDs.
     c.execute("""
         CREATE TABLE IF NOT EXISTS ProcessedLiDARPoints (
             id             INTEGER PRIMARY KEY,
             easting        REAL    NOT NULL,
             northing       REAL    NOT NULL,
             altitude       REAL,
-            zone           TEXT,
-            classification TEXT,
+            zone_id        INTEGER,
+            class_code     INTEGER,
               
             -- precomputed metrics
             normal_x       REAL,
             normal_y       REAL,
             normal_z       REAL,
-            slope       REAL,
-            rough       REAL,
-            curvature   REAL,
+            slope          REAL,
+            rough          REAL,
+            curvature      REAL,
             trav_score     REAL
         )
     """)
@@ -338,18 +358,23 @@ def create_indexes(db_path):
 
     # Create indexes on the ProcessedLiDARPoints table to optimize query performance
     # for analysis, filtering, and path planning operations.
+    
+    # OPTIMIZATION: Redundant indexes commented out to save disk space.
+    # The R-Tree handles spatial lookups, and normal/slope lookups are rare in current usage.
     c.executescript("""
         -- For analysis, filtering, or route planning
-        CREATE INDEX IF NOT EXISTS idx_plp_classification ON ProcessedLiDARPoints(classification);
+        CREATE INDEX IF NOT EXISTS idx_plp_class_code     ON ProcessedLiDARPoints(class_code);
         CREATE INDEX IF NOT EXISTS idx_plp_trav_score     ON ProcessedLiDARPoints(trav_score);
-        CREATE INDEX IF NOT EXISTS idx_plp_rough          ON ProcessedLiDARPoints(rough);
-        CREATE INDEX IF NOT EXISTS idx_plp_slope          ON ProcessedLiDARPoints(slope);
-        CREATE INDEX IF NOT EXISTS idx_plp_curvature      ON ProcessedLiDARPoints(curvature);
-        CREATE INDEX IF NOT EXISTS idx_plp_altitude       ON ProcessedLiDARPoints(altitude);
-        CREATE INDEX IF NOT EXISTS idx_plp_normal_x       ON ProcessedLiDARPoints(normal_x);
-        CREATE INDEX IF NOT EXISTS idx_plp_normal_y       ON ProcessedLiDARPoints(normal_y);
-        CREATE INDEX IF NOT EXISTS idx_plp_normal_z       ON ProcessedLiDARPoints(normal_z);
-        CREATE INDEX IF NOT EXISTS idx_plp_coord          ON ProcessedLiDARPoints(easting, northing);
+        
+        -- Commented out to reduce DB size:
+        -- CREATE INDEX IF NOT EXISTS idx_plp_rough          ON ProcessedLiDARPoints(rough);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_slope          ON ProcessedLiDARPoints(slope);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_curvature      ON ProcessedLiDARPoints(curvature);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_altitude       ON ProcessedLiDARPoints(altitude);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_normal_x       ON ProcessedLiDARPoints(normal_x);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_normal_y       ON ProcessedLiDARPoints(normal_y);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_normal_z       ON ProcessedLiDARPoints(normal_z);
+        -- CREATE INDEX IF NOT EXISTS idx_plp_coord          ON ProcessedLiDARPoints(easting, northing);
     """)
 
     # Commit the changes and close the connection.
@@ -397,6 +422,7 @@ def create_spatial_views(db_path):
     c.execute("PRAGMA synchronous = NORMAL;")
 
     # Create useful spatial views using the R-tree index for rapid querying.
+    # Note: Updated to use integer class_code (2 = Ground)
     c.executescript("""
         -- View: All points in a bounding box
         CREATE VIEW IF NOT EXISTS PointsNearby AS
@@ -411,7 +437,7 @@ def create_spatial_views(db_path):
         SELECT p.*
         FROM ProcessedLiDARPoints_idx AS idx
         JOIN ProcessedLiDARPoints AS p ON p.id = idx.id
-        WHERE p.classification != 'Ground'
+        WHERE p.class_code != 2  -- 2 is 'Ground'
           AND idx.min_x BETWEEN 519307 AND 519317
           AND idx.min_y BETWEEN 4252958 AND 4252973;
 
@@ -422,7 +448,7 @@ def create_spatial_views(db_path):
         JOIN ProcessedLiDARPoints AS p ON p.id = idx.id
         WHERE idx.min_x BETWEEN 519307 AND 519317
           AND idx.min_y BETWEEN 4252958 AND 4252973
-          AND p.classification = 'Ground';
+          AND p.class_code = 2; -- 2 is 'Ground'
 
         -- View: Points in a bounding box and within a specific altitude range
         CREATE VIEW IF NOT EXISTS PointsInRangeWithAltitude AS
@@ -558,23 +584,35 @@ def process_file(file_path, db_path, manual_zone=None):
     zs = las.z
     cls = las.classification
 
-    # Prepare data rows for batch insertion
-    rows = []
-    for x, y, z, c in zip(xs, ys, zs, cls):
-        label = CLASSIFICATION_MAP.get(c, 'User Definable' if c >= 64 else 'Reserved')
-        rows.append((x, y, z, zone_str, label))
-
-    # Connect to SQLite and insert in batches
+    # Connect to SQLite
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     c.execute("PRAGMA journal_mode = WAL;")
     c.execute("PRAGMA synchronous = NORMAL;")
+
+    # OPTIMIZATION: Get or Create ID for this zone string to normalize storage
+    c.execute("SELECT id FROM Zones WHERE label = ?", (zone_str,))
+    result = c.fetchone()
+    if result:
+        zone_id = result[0]
+    else:
+        c.execute("INSERT INTO Zones (label) VALUES (?)", (zone_str,))
+        conn.commit()
+        zone_id = c.lastrowid
+
+    # Prepare data rows for batch insertion
+    # OPTIMIZATION: Using raw integers for zone_id and class_code
+    rows = []
+    for x, y, z, code in zip(xs, ys, zs, cls):
+        rows.append((x, y, z, zone_id, code))
+
+    # Insert in batches
     batch_size = 10000
     for i in range(0, len(rows), batch_size):
         c.executemany(
             """
             INSERT INTO ProcessedLiDARPoints (
-                easting, northing, altitude, zone, classification
+                easting, northing, altitude, zone_id, class_code
             ) VALUES (?, ?, ?, ?, ?)
             """,
             rows[i:i + batch_size]
@@ -1007,6 +1045,12 @@ def main():
     # Step 6: Add B-tree indexes for common attribute queries
     print("[Step 6] - Creating attribute indexes...")
     create_indexes(args.output)
+    
+    # OPTIMIZATION: VACUUM the database to reclaim free space from heavy updates
+    print("[Step 7] - Vacuuming database to reclaim space...")
+    conn = sqlite3.connect(args.output)
+    conn.execute("VACUUM;")
+    conn.close()
 
     # Summary
     total = time.time() - overall_start

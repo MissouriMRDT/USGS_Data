@@ -15,10 +15,11 @@ configs/
 # Temporary SQLite Files
 # ──────────────
 
-# Keep .db files, but ignore SQLite journal files
+# Ignore SQLite files.
 *.db-journal
 *.db-wal
 *.db-shm
+*.db
 
 # ──────────────
 # Editor/Backup Files

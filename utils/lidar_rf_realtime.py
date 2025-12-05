@@ -977,14 +977,14 @@ def load_pointcloud_from_db(db_path: str,
     if bbox:
         min_x, min_y, max_x, max_y = bbox
         q = """
-            SELECT p.id, p.easting, p.northing, p.altitude, p.classification
+            SELECT p.id, p.easting, p.northing, p.altitude
             FROM ProcessedLiDARPoints_idx AS idx
             JOIN ProcessedLiDARPoints AS p ON p.id = idx.id
             WHERE idx.min_x BETWEEN ? AND ? AND idx.min_y BETWEEN ? AND ?
         """
         params = (min_x, max_x, min_y, max_y)
     else:
-        q = "SELECT id, easting, northing, altitude, classification FROM ProcessedLiDARPoints"
+        q = "SELECT id, easting, northing, altitude FROM ProcessedLiDARPoints"
         params = ()
 
     try:
